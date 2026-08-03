@@ -1,0 +1,26 @@
+# V2V receiver parameters. Optional — every value here matches the node's
+# built-in default. Pass with:
+#   ros2 run qcar_science_night_pkg v2v_receiver --ros-args --params-file <this file>
+v2v_receiver_node:
+  ros__parameters:
+    # UDP link
+    bind_ip: "0.0.0.0"
+    bind_port: 47100
+    expected_vehicle_id: "rosbot3"
+    stale_sec: 0.6              # data older than this is dead, never "clear"
+
+    # Rigid transform ROSbot map frame -> QCar map frame.
+    # Identity when both robots localize against the same map of the track.
+    # If the maps are separate, measure two shared physical landmarks in
+    # both frames and solve the 2-D rigid transform once.
+    frame_tx: 0.0
+    frame_ty: 0.0
+    frame_tyaw: 0.0
+
+    # Must match the MPC's reference trajectory so gap/on_path agree with it.
+    trajectory_file: "/home/nvidia/ros2_ws/recorded_path_amcl_final_long.npy"
+    path_spacing: 0.03          # meters between waypoints (3 cm on this path)
+    loop_path: true
+    lane_half_width: 0.35       # |lateral offset| below this = "in our lane"
+
+    log_file: "/home/nvidia/ros2_ws/v2v_rx_log.csv"

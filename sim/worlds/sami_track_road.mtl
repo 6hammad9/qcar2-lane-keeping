@@ -1,0 +1,8 @@
+newmtl asphalt
+Ka 0.20 0.21 0.23
+Kd 0.64 0.66 0.70
+Ks 0.00 0.00 0.00
+Ns 1.0
+d 1.0
+illum 2
+map_Kd sami_track_asphalt.png

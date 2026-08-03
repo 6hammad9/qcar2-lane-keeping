@@ -1,0 +1,9 @@
+build/
+install/
+log/
+bags_and_maps/
+bags_and_paths/
+qcar_camera_bag/
+.vscode/
+__pycache__/
+*.py[cod]

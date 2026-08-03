@@ -1,0 +1,47 @@
+# Gazebo camera calibration. The simulated camera is centered on base_link,
+# unlike the physical camera configuration which has a -0.020 m lateral
+# mounting correction.
+image:
+  topic: "/camera/color_image"
+  width: 1280
+  height: 720
+  # Calibrated on the QCar2 Gazebo camera. The previous 0.40--0.98 crop
+  # missed the right edge; 0.10--0.40 sees both painted lane boundaries.
+  strip_top_fraction: 0.10
+  strip_bottom_fraction: 0.40
+
+segmentation:
+  hsv_low: [0, 0, 170]
+  hsv_high: [180, 45, 255]
+  morph_close_iterations: 2
+
+hough:
+  threshold: 15
+  min_line_length: 20
+  max_line_gap: 40
+  min_slope: 0.2
+
+detection:
+  lane_width_px: 500
+  corridor_px: 70
+  allow_single_boundary: false
+  min_lane_width_px: 180
+  max_lane_width_px: 620
+
+vehicle:
+  camera_offset_m: 0.0
+  lane_width_m: 0.42
+
+control:
+  gain: 0.25
+  max_offset: 0.15
+  filter_alpha: 0.12
+  deadband: 0.01
+
+performance:
+  frame_skip: 3
+  resize_width: 640
+  resize_height: 360
+
+debug:
+  publish: false

@@ -1,0 +1,39 @@
+image:
+  topic: "/camera/color_image"
+  width: 1280
+  height: 720
+  strip_top_fraction: 0.40
+  strip_bottom_fraction: 0.98  
+
+segmentation:
+  hsv_low: [0, 0, 170]
+  hsv_high: [180, 45, 255]
+  morph_close_iterations: 2
+
+hough:
+  threshold: 15
+  min_line_length: 20
+  max_line_gap: 40
+  min_slope: 0.2
+
+detection:
+  lane_width_px: 280
+  corridor_px: 70
+
+vehicle:
+  camera_offset_m: -0.020
+  lane_width_m: 0.42
+
+control:
+  gain: 0.25
+  max_offset: 0.15
+  filter_alpha: 0.12
+  deadband: 0.01
+
+performance:
+  frame_skip: 3
+  resize_width: 640
+  resize_height: 360
+
+debug:
+  publish: true

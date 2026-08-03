@@ -1,0 +1,32 @@
+# OPTIONAL obstacle-test scenario. The default V2V world is deliberately
+# generated without this file so QCar reacts only to the simulated ROSbot.
+# To test static-obstacle sensing, regenerate explicitly with:
+#   python3 map_to_sdf.py --map assets/track_map.yaml \
+#                --obstacles obstacles.yaml --rosbot-csv assets/smoothed_trajectory.csv \
+#                --qcar-npy assets/qcar_half_map_centerline.npy --out worlds/sami_track.sdf
+#
+# Coordinates are in the REAL map frame (Sami's track_map) — measure a prop's
+# position on the physical track (RViz clicked point / tape from a landmark)
+# and enter it here 1:1.
+#
+# Fields: name, x, y [m, map frame], yaw [rad], sx/sy/sz box size [m].
+
+# On-path box at waypoint 350 of the shared trajectory — a straight section
+# (0 deg heading change over 30 wp), so the QCar is allowed to overtake it.
+- name: box_on_path_wp350
+  x: 1.612
+  y: 4.378
+  yaw: 2.635        # path heading at wp350 (151 deg) — box aligned with lane
+  sx: 0.15
+  sy: 0.25
+  sz: 0.30
+
+# Off-path clutter near the wp450 straight (0.8 m left of the lane) — should
+# NOT trigger any reaction; useful as a false-positive check.
+- name: clutter_off_path
+  x: -0.21
+  y: 3.35
+  yaw: 0.0
+  sx: 0.20
+  sy: 0.20
+  sz: 0.25

@@ -1,0 +1,75 @@
+# launch slam node
+ros2 launch slam_toolbox online_async_launch.py slam_params_file:=config/slam_params.yaml use_sim_time:=false
+# updated
+os2 launch slam_toolbox online_async_launch.py \
+  slam_params_file:=config/slam_params.yaml \
+  use_sim_time:=false
+
+# RUn the robot
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
+ros2 run teleop_twist_keyboard teleop_twist_keyboard cmd_vel:=/rosbot3/cmd_vel --ros-args -p stamped:=true
+
+# create the node
+ros2 pkg create --build-type ament_python rosbot_lane --dependencies rclpy sensor_msgs std_msgs geometry_msgs cv_bridge
+
+
+# to register the node
+sed -i "s/'console_scripts': \[/'console_scripts': [\n            'straight_lane_node = rosbot_lane.straight_lane_node:main',/" ~/rosbot_ws/src/rosbot_lane/setup.py
+
+# source before ros2 run
+
+
+
+# Rebuild and run
+cd ~/rosbot_ws
+colcon build --packages-select rosbot_lane && source install/setup.bash
+ros2 run rosbot_lane straight_lane_node
+
+
+
+T1:
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+
+T2:
+ros2 launch nav2_bringup localization_launch.py \
+  map:=config/track_map.yaml \
+  params_file:=config/amcl_params.yaml \
+  use_sim_time:=false
+  
+T3:
+# Activate lifecycle nodes
+ros2 lifecycle set /map_server configure
+ros2 lifecycle set /map_server activate
+ros2 lifecycle set /amcl configure
+ros2 lifecycle set /amcl activate
+
+# Global localization (find robot on map)
+ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
+
+T4:
+
+
+
+
+
+
+
+
+
+
+recording:
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+
+ros2 launch slam_toolbox online_async_launch.py \
+  slam_params_file:=config/slam_params.yaml \
+  use_sim_time:=false
+  
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/temp/slam_trajectory_recorder.py
+
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args -r cmd_vel:=/rosbot3/cmd_vel -p stamped:=true
+ 
+ros2 run nav2_map_server map_saver_cli -f ~/Documents/rosbot_ws/src/rosbot_lane/config/track_map
+
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
+  "{filename: 'config/track_map'}"

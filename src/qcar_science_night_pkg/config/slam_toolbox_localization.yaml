@@ -1,0 +1,107 @@
+slam_toolbox:
+  ros__parameters:
+
+    # ── Frames ──────────────────────────────────────────────────────────────
+    odom_frame: odom
+    base_frame: base_link
+    map_frame: map
+    scan_topic: /scan_fixed
+
+    # ── Mode ────────────────────────────────────────────────────────────────
+    mode: localization
+    use_sim_time: false
+    
+    # map to load
+    map_file_name: /home/nvidia/ros2_ws/maps/test_map
+    map_start_at_dock: true
+
+    # ── Solver ──────────────────────────────────────────────────────────────
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+
+    # ── Scan matching ────────────────────────────────────────────────────────
+    # use_scan_matching: run fine ICP-style matcher after coarse correlation
+    use_scan_matching: true
+    use_scan_barycenter: true
+
+    # How far/how much the robot must move before a new scan is added.
+    # Keep low so we don't miss detail on slow QCar movements.
+    minimum_travel_distance: 0.05       # metres
+    minimum_travel_heading: 0.05        # radians (~3°)
+
+    # scan_buffer_size: how many recent scans Karto keeps in the local window.
+    # 10 is conservative and safe for A2M12 at ~24 Hz effective rate.
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+
+    # Fine matcher thresholds — lower = accept more matches (more robust
+    # in featureless corridors); raise if map drifts.
+    link_match_minimum_response_fine: 0.1
+    distance_decomposition_radius: 3.5
+
+    # Maximum distance between two linked scans in the pose graph.
+    # Raised from 1.5 → 2.5 to handle throttled scan rate.
+    link_scan_maximum_distance: 2.5
+
+    # ── Loop closure ─────────────────────────────────────────────────────────
+    # Disabled for now — enable once basic mapping is stable.
+    do_loop_closing: false
+    loop_search_maximum_distance: 3.0
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # ── Correlation search ───────────────────────────────────────────────────
+    # CRITICAL: these three values size Karto's internal probability grid.
+    # If dimension is too large relative to resolution, Karto walks out of
+    # bounds and throws "unable to get pointer in probability search".
+    #
+    # Rule of thumb: dimension / resolution < ~30 cells per side is safe.
+    # 0.3 / 0.01 = 30  ← right at the safe limit
+    correlation_search_space_dimension: 0.3      # was 0.5 — caused crash
+    correlation_search_space_resolution: 0.01    # was 0.02
+    correlation_search_space_smear_deviation: 0.05  # was 0.1
+
+    # ── Loop closure search space ────────────────────────────────────────────
+    loop_search_space_dimension: 5.0             # was 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # ── Timing / load reduction ──────────────────────────────────────────────
+    # scan_queue_size: internal queue depth. 50 is enough given throttling.
+    scan_queue_size: 50                          # was 200
+
+    # throttle_scans: process 1 in every N scans.
+    # Set to 1 — let minimum_time_interval do the throttling instead.
+    throttle_scans: 1                            # was 12
+
+    # minimum_time_interval: minimum wall-clock gap between processed scans.
+    # 0.5 s → ~2 Hz effective mapping rate. Safe for Karto on Jetson.
+    minimum_time_interval: 0.5
+
+    transform_publish_period: 0.05              # publish map→odom at 20 Hz
+    map_update_interval: 5.0                    # rebuild occupancy grid every 2 s
+    resolution: 0.05                            # map cell size (metres)
+    max_laser_range: 9.0                        # A2M12 reliable range
+
+    # TF timing — generous to absorb any residual pipeline jitter
+    transform_timeout: 0.3
+    tf_buffer_duration: 30.0
+
+    stack_size_to_use: 40000000
+
+    # ── Penalties ────────────────────────────────────────────────────────────
+    # Higher penalties make Karto reject implausible pose jumps.
+    # Raised slightly to prevent the solver from proposing poses that
+    # land outside the probability grid.
+    distance_variance_penalty: 1.0              # was 0.5
+    angle_variance_penalty: 1.5                 # was 1.0
+
+    fine_search_angle_offset: 0.00349           # ~0.2°
+    coarse_search_angle_offset: 0.349           # ~20°
+    coarse_angle_resolution: 0.0349             # ~2°
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: false
