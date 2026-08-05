@@ -146,7 +146,32 @@ class PathUtils:
         if previous_idx > 0 and distance > 0.75 and end < len(trajectory):
             # Recover after a localization jump, but never regress into a
             # completed part of the path. Loop reset is handled explicitly.
-            best, _ = find_best(previous_idx, len(trajectory))
+            #
+            # The recovery search is BOUNDED. Searching to the end of the
+            # trajectory defeats the window this function just applied: on a
+            # self-crossing route the nearest point by distance is often a
+            # parallel branch hundreds of indices away, and the monotonic
+            # clamp below then makes that error permanent. Measured on the
+            # 20260802 track, branches pass within 0.02-0.26 m of each other,
+            # so an unbounded search reliably hops. Observed as idx 286 ->
+            # 685 with the reference stuck 1.49 m away and the yaw error
+            # still small -- the failure this docstring warns about.
+            #
+            # A bounded search still crosses a genuine localization jump,
+            # which is at most a few metres. If nothing closer exists inside
+            # the bound the previous index is kept, the position error stays
+            # large, and the tracking safety stop halts the car. That is the
+            # honest outcome: the reference really is unknown.
+            recovery_end = min(
+                len(trajectory),
+                previous_idx + 2 * window_forward,
+            )
+            candidate, candidate_distance = find_best(
+                previous_idx,
+                recovery_end,
+            )
+            if candidate_distance < distance:
+                best = candidate
 
         return max(best, previous_idx)
 
