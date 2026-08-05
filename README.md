@@ -77,9 +77,14 @@ ros2 launch qcar2_nodes qcar2_cartographer_launch.py \
   resolution:=0.05
 ```
 
-This also starts the camera. **Do not run `rgbd` separately** — two processes
-on one RealSense gives `-13 An operating system function returned an
-unrecognized error`.
+**This does NOT start the camera.** `enable_camera` defaults to `false`
+(`qcar2_launch.py`), and this launch includes that file without overriding it,
+so the RGB-D node is never spawned. Add `enable_camera:=true` if you want it.
+Localization needs only the LiDAR, so the known-good lap ran without it.
+
+If you do enable it, the node is named **`RealsenseCamera`**, not `rgbd`, and
+you must not also run `ros2 run qcar2_nodes rgbd` — two processes on one
+RealSense fail to open the device.
 
 Block until TF is up, or the MPC spams `TF unavailable`:
 

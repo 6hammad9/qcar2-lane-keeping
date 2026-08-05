@@ -254,21 +254,51 @@ TRAJECTORY_BUILDER.pure_localization_trimmer = { max_submaps_to_keep = 3 }
 Note the launch resolved `qcar2_nodes` from **`~/ros2_ws`**, not
 `~/qcar_v2v_ws` — check which file is really being loaded.
 
-### 3.4 Camera dead
+### 3.4 Camera "dead" — RESOLVED, it was never being started
 
-`ros2 node list` shows no camera node; `/camera/color_image` appears in
-`ros2 topic list` only because a subscriber exists. The `rgbd` node started
-and then died with:
-```
-rgb stream: -13 -> An operating system function returned an unrecognized error.
-```
-`-13` is the RealSense refusing to open. Confirmed cause once: **two `rgbd`
-processes** (the T1 launch starts one; another was started by hand). Do not
-run `ros2 run qcar2_nodes rgbd` separately.
+`ros2 node list` shows no camera node and `/camera/color_image` appears in
+`ros2 topic list` only because `lane_centering_node` subscribes to it — a
+topic with a subscriber and zero publishers.
 
-If it recurs with a single instance: `lsusb | grep -i intel`, then replug —
-the D435i needs USB 3, and a stale handle from a killed process can poison
-the device until power-cycled.
+**The T1 launch does not start the camera.** `qcar2_launch.py` declares:
+```python
+DeclareLaunchArgument("enable_camera", default_value="false", ...)
+```
+and gates the node on `IfCondition(enable_camera)`.
+`qcar2_cartographer_launch.py` includes that file with **no
+`launch_arguments`**, so the default stands and the node is never spawned.
+Earlier notes in this file and in `RUNBOOK.md` claimed T1 starts the camera;
+that was wrong.
+
+Start it explicitly:
+```bash
+ros2 launch qcar2_nodes qcar2_cartographer_launch.py ... enable_camera:=true
+```
+
+Two traps when checking:
+- The node is named **`RealsenseCamera`**, not `rgbd`. Grepping node list for
+  "rgbd" finds nothing even when it is running.
+- On any open/stream failure `rgbd.cpp` **returns from its constructor**
+  (lines 75 and 95) *before* advertising publishers or creating the timer.
+  The node object still exists and spins, so it appears in `ros2 node list`
+  while publishing nothing forever. `ros2 node info /RealsenseCamera` with an
+  empty Publishers list is the signature.
+
+**The `-13` seen previously was a frame-read failure, not an open failure.**
+That `%d -> %s` format only occurs at `rgbd.cpp:237/247/276/286`, all in
+`publishImages()`; the open paths (lines 74, 92) print no number. So the
+device opened and streaming started, then frames stopped arriving. The
+defaults request **1280x720 @ 30 fps for colour and depth simultaneously**,
+which is impossible on USB 2.1 and marginal on USB 3 — and the parameter
+description in the source warns that only certain
+width/height/rate combinations are valid. If it recurs, lower them:
+```bash
+ros2 run qcar2_nodes rgbd --ros-args \
+  -p frame_width_rgb:=640 -p frame_height_rgb:=480 \
+  -p frame_width_depth:=640 -p frame_height_depth:=480 -p frame_rate:=15.0
+```
+(launch with `enable_camera:=false` in that case, so only one process owns
+the device). Also check `lsusb | grep -i intel` reports USB 3, not 2.1.
 
 ---
 

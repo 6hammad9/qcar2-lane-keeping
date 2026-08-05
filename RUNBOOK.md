@@ -110,10 +110,12 @@ State goes `STARTUP_WAIT` -> `DRIVE` and **the car moves**.
 
 ### Optional - camera, lane centering, browser view
 
-None of these are needed to drive. **The camera is already started by the
-Terminal 1 launch** - do NOT run `rgbd` separately; two processes on one
-RealSense gives `-13 An operating system function returned an unrecognized
-error`.
+None of these are needed to drive. **The Terminal 1 launch does NOT start the
+camera** - `enable_camera` defaults to `false` in `qcar2_launch.py` and the
+cartographer launch does not override it. Add `enable_camera:=true` to the
+Terminal 1 command to get it. The node is called `RealsenseCamera`, not
+`rgbd`. Do not also run `ros2 run qcar2_nodes rgbd`; two processes on one
+RealSense cannot both open the device. See HANDOFF §3.4.
 
 ```bash
 ros2 run qcar_science_night_pkg lane_centering_node --ros-args   -p config_file:=$(ros2 pkg prefix qcar_science_night_pkg)/share/qcar_science_night_pkg/config/lane_params.yaml

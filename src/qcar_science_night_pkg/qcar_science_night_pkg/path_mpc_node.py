@@ -1392,20 +1392,39 @@ class QCar2PathMPC(Node):
         msg.data = bool(allow_overtake)
         self.allow_overtake_pub.publish(msg)
 
-        # Signed, so the LiDAR corridor knows which way to bend. Published
-        # every cycle regardless of allow_overtake: the corridor is needed
-        # most precisely when overtaking is forbidden, i.e. in a curve.
-        self.current_signed_curvature = signed_curvature_preview(
-            self.trajectory[:, 3],
-            self.closest_idx,
-            self.N,
-            self.loop_path,
-        )
+        return allow_overtake, max_curvature, mean_curvature
+
+    def publish_path_curvature(self):
+        """Publish the signed route curvature, unconditionally.
+
+        This deliberately does NOT live in publish_overtake_permission or
+        anywhere else downstream of the control loop's gates. Everything
+        there is reachable only once the car is validated, localized,
+        aligned and about to drive, and the corridor is needed before all of
+        that: lidar_overtake bends its detection boxes with this topic, so a
+        silent absence means curve detection degrades to the straight boxes
+        exactly while the car is starting up. It is also the pre-flight
+        check the RUNBOOK tells you to run, which has to work on a
+        stationary car.
+
+        Depends only on the loaded route and the last known index, both of
+        which exist from __init__ onwards.
+        """
+        try:
+            self.current_signed_curvature = signed_curvature_preview(
+                self.trajectory[:, 3],
+                self.closest_idx,
+                self.N,
+                self.loop_path,
+            )
+        except (AttributeError, IndexError, TypeError):
+            # Route not loaded yet. Straight is the safe report: it is what
+            # the corridor falls back to anyway.
+            self.current_signed_curvature = 0.0
+
         curvature_msg = Float32()
         curvature_msg.data = float(self.current_signed_curvature)
         self.path_curvature_pub.publish(curvature_msg)
-
-        return allow_overtake, max_curvature, mean_curvature
 
     def _progress_since(self, start_s):
         if start_s is None:
@@ -1614,6 +1633,9 @@ class QCar2PathMPC(Node):
         return None, 0.0, True
     
     def _control_loop(self):
+        # Before every gate below. See publish_path_curvature for why.
+        self.publish_path_curvature()
+
         if self.mission_done:
             self.stop()
             return
