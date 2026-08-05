@@ -87,16 +87,16 @@ The complete navigation pipeline is shown below.
 
 Every major subsystem has a clearly defined responsibility.
 
-| Module | Responsibility |
-|---------|---------------|
-| Cartographer | Generate occupancy grid maps |
-| AMCL | Estimate global vehicle pose |
-| EKF | Fuse wheel encoder and IMU measurements |
-| MPC | Follow reference trajectory |
-| LiDAR Analyzer | Detect obstacles |
-| Trajectory Recorder | Record reference paths |
-| Path Processor | Generate smooth MPC trajectory |
-| Emergency Stop | Stop vehicle when required |
+| Module              | Responsibility                          |
+| ------------------- | --------------------------------------- |
+| Cartographer        | Generate occupancy grid maps            |
+| AMCL                | Estimate global vehicle pose            |
+| EKF                 | Fuse wheel encoder and IMU measurements |
+| MPC                 | Follow reference trajectory             |
+| LiDAR Analyzer      | Detect obstacles                        |
+| Trajectory Recorder | Record reference paths                  |
+| Path Processor      | Generate smooth MPC trajectory          |
+| Emergency Stop      | Stop vehicle when required              |
 
 ---
 
@@ -348,6 +348,7 @@ self.get_logger().error(...)
 This greatly simplifies debugging during autonomous operation.
 
 ---
+
 # 7. TF Tree
 
 The navigation stack follows the standard ROS2 TF hierarchy.
@@ -369,13 +370,13 @@ The navigation stack follows the standard ROS2 TF hierarchy.
 
 ## Frame Description
 
-| Frame | Publisher | Description |
-|---------|-----------|-------------|
-| map | AMCL | Global fixed frame |
-| odom | EKF | Continuous odometry frame |
-| base_link | EKF | Vehicle body frame |
-| base_scan | Robot State Publisher | LiDAR frame |
-| camera_link | Robot State Publisher | RealSense frame |
+| Frame       | Publisher             | Description               |
+| ----------- | --------------------- | ------------------------- |
+| map         | AMCL                  | Global fixed frame        |
+| odom        | EKF                   | Continuous odometry frame |
+| base_link   | EKF                   | Vehicle body frame        |
+| base_scan   | Robot State Publisher | LiDAR frame               |
+| camera_link | Robot State Publisher | RealSense frame           |
 
 ---
 
@@ -383,42 +384,42 @@ The navigation stack follows the standard ROS2 TF hierarchy.
 
 ## Sensor Topics
 
-| Topic | Type | Publisher |
-|---------|------|-----------|
-| /scan | sensor_msgs/LaserScan | LiDAR |
-| /camera/depth/image_rect_raw | sensor_msgs/Image | RealSense |
-| /imu | sensor_msgs/Imu | IMU |
-| /ekf_odom | nav_msgs/Odometry | EKF |
+| Topic                        | Type                  | Publisher |
+| ---------------------------- | --------------------- | --------- |
+| /scan                        | sensor_msgs/LaserScan | LiDAR     |
+| /camera/depth/image_rect_raw | sensor_msgs/Image     | RealSense |
+| /imu                         | sensor_msgs/Imu       | IMU       |
+| /ekf_odom                    | nav_msgs/Odometry     | EKF       |
 
 ---
 
 ## Localization Topics
 
-| Topic | Description |
-|---------|-------------|
-| /map | Occupancy grid |
-| /amcl_pose | Estimated vehicle pose |
-| /particlecloud | AMCL particles |
-| /tf | Transform tree |
+| Topic          | Description            |
+| -------------- | ---------------------- |
+| /map           | Occupancy grid         |
+| /amcl_pose     | Estimated vehicle pose |
+| /particlecloud | AMCL particles         |
+| /tf            | Transform tree         |
 
 ---
 
 ## Navigation Topics
 
-| Topic | Description |
-|---------|-------------|
-| /reference_path | MPC reference trajectory |
-| /cmd_vel | Velocity commands |
-| /vehicle_command | Steering and throttle |
+| Topic            | Description              |
+| ---------------- | ------------------------ |
+| /reference_path  | MPC reference trajectory |
+| /cmd_vel         | Velocity commands        |
+| /vehicle_command | Steering and throttle    |
 
 ---
 
 ## Obstacle Topics
 
-| Topic | Description |
-|---------|-------------|
+| Topic                 | Description           |
+| --------------------- | --------------------- |
 | /depth_emergency_stop | Emergency stop signal |
-| /obstacle_status | Obstacle information |
+| /obstacle_status      | Obstacle information  |
 
 ---
 
@@ -732,6 +733,7 @@ The MPC loads this file once during initialization.
 No additional preprocessing is required during runtime.
 
 ---
+
 # 14. Model Predictive Controller (MPC)
 
 The MPC controller is responsible for autonomous vehicle motion. Unlike classical controllers such as Pure Pursuit or Stanley, MPC predicts the future vehicle motion over a finite prediction horizon and computes an optimal sequence of control commands.
