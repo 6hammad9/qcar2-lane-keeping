@@ -1788,8 +1788,33 @@ class QCar2PathMPC(Node):
                 self.stop()
                 return
 
+        # While a lateral offset is commanded -- an overtake, a return, a
+        # lane-centering correction -- the car is deliberately NOT on the
+        # recorded route, so matching the raw pose against it is wrong twice
+        # over. The measured error includes the offset even when tracking is
+        # perfect, and on this self-crossing route (branches 0.02-0.26 m
+        # apart) a 0.30 m offset can put the car nearer a PARALLEL branch
+        # than its own, so the index search follows it there. Observed as
+        # "Tracking safety stop: position_error=1.35 m, yaw_error=3.2 deg"
+        # in the middle of an otherwise healthy OVERTAKE_LEFT.
+        #
+        # So search from where the car would be with the offset removed:
+        # slide it back across its own heading by the commanded amount. The
+        # lateral unit vector for heading psi is (-sin psi, cos psi).
+        commanded_offset = (
+            self.avoidance_offset_filtered + self.lane_offset_filtered
+        )
+        if not math.isfinite(commanded_offset):
+            commanded_offset = 0.0
+
+        search_pose = (
+            pose[0] + commanded_offset * math.sin(pose[2]),
+            pose[1] - commanded_offset * math.cos(pose[2]),
+            pose[2],
+        )
+
         self.closest_idx = PathUtils.closest_point(
-            pose,
+            search_pose,
             self.trajectory,
             self.closest_idx,
             global_search=self.global_path_acquisition,
@@ -1802,9 +1827,11 @@ class QCar2PathMPC(Node):
 
         closest_point = self.trajectory[self.closest_idx]
 
+        # Measure the error against the reference the car was actually asked
+        # to follow, not the unoffset route.
         tracking_error = math.hypot(
-            pose[0] - closest_point[0],
-            pose[1] - closest_point[1],
+            search_pose[0] - closest_point[0],
+            search_pose[1] - closest_point[1],
         )
 
         yaw_error = PathUtils.wrap_angle(
