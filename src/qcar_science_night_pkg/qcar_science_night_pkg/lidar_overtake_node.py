@@ -90,7 +90,7 @@ class LidarOvertakeNode(Node):
         # Obstacle/emergency lookahead. See the note at the assignment site.
         self.declare_parameter("front_stop_straight_m", 1.90)
         self.declare_parameter("emergency_stop_straight_m", 0.70)
-        self.declare_parameter("front_stop_curve_m", 1.20)
+        self.declare_parameter("front_stop_curve_m", 0.90)
         self.declare_parameter("emergency_stop_curve_m", 0.65)
         self.declare_parameter("overtake_start_min_distance_m", 1.50)
         self.declare_parameter("hard_stop_front_distance_m", 0.40)

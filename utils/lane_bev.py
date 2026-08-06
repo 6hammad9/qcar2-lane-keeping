@@ -70,10 +70,11 @@ def warp(img, reverse=False, out_shape=None):
     return cv2.warpPerspective(img, m, (BEV, BEV))
 
 
-MIN_PAINT_LEVEL = 95        # Otsu split below this is not paint
-MIN_PAINT_FRACTION = 0.004  # less bright area than this is noise
+MIN_PAINT_LEVEL = 95        # a split below this is floor, not paint
+MIN_PAINT_FRACTION = 0.002  # less bright area than this is noise
 MAX_PAINT_FRACTION = 0.30   # more than this is not markings
-MIN_CONTRAST = 18.0         # grey spread below this has no modes to split
+MIN_CONTRAST = 12.0         # grey spread below this carries no information
+MIN_PAINT_SEPARATION = 55.0  # p99 - p50; no bright tail means no markings
 
 
 def threshold(bev):
@@ -108,13 +109,26 @@ def threshold(bev):
     if road.size < 0.05 * grey.size or float(road.std()) < MIN_CONTRAST:
         return np.zeros_like(grey)
 
-    level, binary = cv2.threshold(
-        grey, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    if level < MIN_PAINT_LEVEL:
+    # Paint is a thin BRIGHT TAIL, not a mode, so Otsu cannot find it.
+    # Measured on this track: floor median 109, p90 125, p99 254 -- the
+    # markings are about 1% of road pixels. Otsu maximizes between-class
+    # variance, so at 99:1 it always prefers to split the floor's own
+    # shadow-vs-lit variation and ignores the paint: on the full image it
+    # chose 70 (below the floor itself, 82% "bright"), and even restricted
+    # to road pixels it chose 104, still under the 109 median, 60% "bright".
+    #
+    # Separating a tail from a bulk is a percentile question. The gap
+    # between them is also what says whether there is any paint at all: on a
+    # blank stretch p99 sits a few levels above p50, on a marked one it is
+    # over a hundred above.
+    floor_level, paint_level = np.percentile(road, [50, 99])
+    if paint_level - floor_level < MIN_PAINT_SEPARATION:
         return np.zeros_like(grey)
 
-    fraction = float(np.count_nonzero(binary)) / float(binary.size)
+    level = max(float(MIN_PAINT_LEVEL), 0.5 * (floor_level + paint_level))
+
+    binary = np.where((grey >= level) & (grey > 0), 255, 0).astype(np.uint8)
+    fraction = float(np.count_nonzero(binary)) / float(road.size)
     if not MIN_PAINT_FRACTION <= fraction <= MAX_PAINT_FRACTION:
         return np.zeros_like(grey)
 
@@ -292,11 +306,14 @@ def draw(frame, bev, fit, offset, mode, confidence):
 
 class LaneBEV(Node):
 
-    def __init__(self, save=None):
+    def __init__(self, save=None, frame_skip=3):
         super().__init__("lane_bev")
         self.bridge = CvBridge()
         self.save = save
         self.n = 0
+        # Process 1 frame in frame_skip. See cb() for why 30 Hz is waste.
+        self.frame_count = 0
+        self.frame_skip = max(1, int(frame_skip))
         self.offset_pub = self.create_publisher(Float32, "/lane_center_offset", 10)
         self.valid_pub = self.create_publisher(Bool, "/lane_center_valid", 10)
         # The MPC scales its lane-centering authority by this, so a weak or
@@ -315,6 +332,20 @@ class LaneBEV(Node):
         )
 
     def cb(self, msg):
+        # Throttle. Measured on the car this node burned 305% CPU -- three
+        # cores of eight -- warping 1280x720 into an 800x800 bird's-eye and
+        # running a twelve-window search on every frame at 30 Hz. That drove
+        # the load average past 6, starved the MPC's control loop and left
+        # the machine unable to accept an SSH connection.
+        #
+        # It feeds a lane correction capped at 0.12 m on a car doing 0.6 m/s,
+        # so 30 Hz buys nothing: at 10 Hz the car moves 6 cm between frames,
+        # which is well inside the correction's own resolution. Control rate
+        # is what must not be starved.
+        self.frame_count += 1
+        if self.frame_count % self.frame_skip:
+            return
+
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception:
@@ -365,10 +396,11 @@ class LaneBEV(Node):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--save", default=None)
+    ap.add_argument("--frame-skip", type=int, default=3)
     args, _ = ap.parse_known_args()
 
     rclpy.init()
-    node = LaneBEV(save=args.save)
+    node = LaneBEV(save=args.save, frame_skip=args.frame_skip)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
