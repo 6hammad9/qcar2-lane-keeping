@@ -90,7 +90,12 @@ ros2 run qcar_science_night_pkg lidar_overtake --ros-args \
   -p emergency_stop_curve_m:=0.65
 ```
 
-Stop: `ros2 topic pub --once /motion_enable std_msgs/msg/Bool "{data: false}"`
+Stop: **`pkill -x lidar_overtake`** (or the E-stop).
+
+> `ros2 topic pub --once /motion_enable ... false` does **not** stop the car —
+> `lidar_overtake` republishes that topic every cycle and overwrites the
+> one-shot within ~100 ms. Verified on the vehicle 2026-08-06. See
+> `RUNBOOK.md` §Stop.
 
 ---
 

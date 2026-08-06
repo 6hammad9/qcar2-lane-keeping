@@ -156,8 +156,19 @@ State goes `STARTUP_WAIT` → `DRIVE` and **the car moves**.
 ### Stopping
 
 ```bash
-ros2 topic pub --once /motion_enable std_msgs/msg/Bool "{data: false}"
+pkill -x lidar_overtake
 ```
+
+> **Do NOT rely on `ros2 topic pub --once /motion_enable ... false`.** It does
+> not stop the car. `lidar_overtake` republishes `/motion_enable` every cycle,
+> so a one-shot publish is overwritten within ~100 ms and the car re-arms
+> itself. Verified on the vehicle 2026-08-06: `/motion_enable` still read
+> `true` well after the one-shot was sent.
+>
+> Killing `lidar_overtake` is the reliable software stop — the MPC's
+> `behavior_data_fresh()` gate then fails and it halts with
+> `Motion blocked: LiDAR behavior heartbeat is missing or stale`.
+> **The E-stop remains the real stop.** Use it if anyone is near the car.
 
 ### Confirm it is healthy
 

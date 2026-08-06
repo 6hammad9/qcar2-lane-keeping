@@ -147,10 +147,27 @@ then become safe.
 ### Stop
 
 ```bash
-ros2 topic pub --once /motion_enable std_msgs/msg/Bool "{data: false}"
+pkill -x lidar_overtake
 ```
 
-Or `tmux kill-session -t car`. Emergency: physical E-stop.
+The MPC then halts with `Motion blocked: LiDAR behavior heartbeat is missing
+or stale`, because `behavior_data_fresh()` needs `/drive_state` and
+`/avoidance_offset` under 0.7 s old.
+
+**Emergency: physical E-stop.** Use it whenever anyone is near the car.
+
+> **`ros2 topic pub --once /motion_enable ... false` DOES NOT STOP THE CAR.**
+> This was the documented stop procedure and it is wrong. `lidar_overtake`
+> republishes `/motion_enable` on every cycle, so the one-shot is overwritten
+> within ~100 ms and the car re-arms. Verified 2026-08-06: `/motion_enable`
+> still read `true` long after the one-shot, while someone was walking around
+> the vehicle. Use `pkill -x lidar_overtake`, or the E-stop.
+>
+> Note `pkill -f <pattern>` is unsafe over SSH here: the pattern matches your
+> own command line, so `pkill -f lidar_overtake` kills the shell running it.
+> Use `-x` (exact process name). Also beware that Linux truncates process
+> names to 15 characters, so `pgrep -x cartographer_node` never matches a
+> running Cartographer — check the launch log instead.
 
 ---
 
