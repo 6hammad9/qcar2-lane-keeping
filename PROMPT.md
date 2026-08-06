@@ -159,7 +159,19 @@ Work is pushed to `https://github.com/6hammad9/qcar2-lane-keeping` on branch
 `fix/lidar-curve-corridor`. It is an **orphan branch** — the original repo has
 ~2.4 GB of committed VS Code caches (`browse.vc.db`, three ~1 GB revisions)
 and a 185 MB rosbag, all over GitHub's 100 MB file limit, so its history
-cannot be pushed. The ROSbot package is included under `rosbot_opta2/`.
+cannot be pushed.
+
+**The ROSbot code is a SEPARATE repo**, maintained by a teammate:
+`https://github.com/samiahmed7/rosbot3` (locally at
+`E:/WSL/Ubuntu-24.04/rosbot3`). It holds the V2V broadcaster, the gate that
+obeys hold commands, and `rosbot_lane/v2v_dashboard.py` — one page showing
+both robots' cameras and decoded V2V state on port 8090, run on both
+machines with `--role qcar2` / `--role rosbot3`.
+
+Do not vendor a copy of it into this repo. An earlier `rosbot_opta2/`
+snapshot was removed precisely because it had already gone stale against
+the real thing: its broadcaster and gate were both older than the versions
+actually running on the robot.
 
 Run the tests before and after any change:
 
