@@ -75,6 +75,9 @@ class LidarOvertakeNode(Node):
         self.declare_parameter("emergency_stop_curve_m", 0.65)
         self.declare_parameter("overtake_start_min_distance_m", 0.60)
         self.declare_parameter("hard_stop_front_distance_m", 0.40)
+        # How far the adjacent lane must be clear before a pass is allowed.
+        # Previously hardcoded at the analyzer's 0.75 m default.
+        self.declare_parameter("lane_clear_distance_m", 0.75)
         # Detection-box extents. These are the hard limit on what can be
         # seen at all; scale them with speed. Defaults preserve the previous
         # hardcoded values, which suit roughly 1.0 m/s and below.
@@ -267,6 +270,25 @@ class LidarOvertakeNode(Node):
             # route the car is about to drive rather than against straight
             # ahead.
             front_narrow_half_width=float(gp("front_narrow_half_width_m")),
+
+            # DETECTION DISTANCES. These were never passed, so the analyzer
+            # silently used its own defaults of 0.75 m and no amount of
+            # raising front_stop_straight_m had any effect: obstacle_ahead
+            # simply could not fire beyond 0.75 m, and
+            # limit_status_for_path_context can only narrow that further,
+            # never widen it. Braking from 0.75 m left the car at about
+            # 0.4 m, below overtake_start_min_distance_m, so it could see the
+            # obstacle but never had room to commit to a pass -- the operator
+            # had to push the car forward by hand every time.
+            overtake_start_distance=float(gp("front_stop_straight_m")),
+            emergency_distance=float(gp("emergency_stop_straight_m")),
+
+            # Distance the adjacent lane must be clear for before a pass is
+            # allowed. Also previously unpassed and stuck at 0.75 m, which is
+            # why L=False was reported with an empty passing lane once
+            # side_box_max_m was widened: a bigger box sees more, and every
+            # return inside 0.75 m counted as blocking.
+            lane_clear_distance=float(gp("lane_clear_distance_m")),
 
             # Keep low so legs/feet/thin objects are not missed.
             min_front_points=1,
@@ -732,10 +754,19 @@ class LidarOvertakeNode(Node):
 
         return_shift = self.swept_return_lateral_shift()
         path_curvature = self.current_path_curvature()
+
+        # Shift the emergency corridor to the lateral offset currently
+        # commanded, so it sweeps with a lane change instead of staring
+        # straight ahead through it. 999.0 is the node's "no offset" sentinel.
+        lateral_intent = 0.0
+        if abs(self.last_commanded_offset) < 900.0:
+            lateral_intent = float(self.last_commanded_offset)
+
         status = self.analyzer.analyze(
             msg,
             return_lateral_shift_m=return_shift,
             path_curvature=path_curvature,
+            lateral_intent_m=lateral_intent,
         )
 
         status, path_context, effective_front_stop_m, effective_emergency_stop_m = (

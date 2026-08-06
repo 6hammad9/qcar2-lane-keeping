@@ -228,7 +228,25 @@ class LidarSectorAnalyzer:
         scan_msg,
         return_lateral_shift_m=None,
         path_curvature=0.0,
+        lateral_intent_m=0.0,
     ):
+        """``lateral_intent_m`` shifts the emergency corridor to where the
+        car is going, positive left.
+
+        Without it the corridor stares straight ahead throughout a lane
+        change. Mid-swing the car is still behind the obstacle it is
+        passing, the obstacle is inside the +/-0.12 m corridor at under the
+        emergency distance, and the car emergency-stops in the middle of its
+        own manoeuvre. Observed as OVERTAKE_LEFT -> EMERGENCY_STOP, and
+        worked around by pushing the obstacle further away so the swing
+        completed before the corridor caught it.
+
+        The corridor is meant to be the volume the car will sweep, so during
+        a commitment to a lateral offset it has to sweep with it. The wide
+        front box and the absolute hard_stop_front_distance are untouched
+        and keep their authority, so this cannot blind the car to something
+        genuinely in its way.
+        """
         points = self.scan_to_xy(scan_msg)
 
         half = self.half_lane_width
@@ -289,7 +307,7 @@ class LidarSectorAnalyzer:
             self.emergency_x_max,
             self.emergency_half_width,
             path_curvature,
-            center_y=self.emergency_center_y,
+            center_y=self.emergency_center_y + float(lateral_intent_m),
         )
 
         front_min = self.min_distance(front_points)
