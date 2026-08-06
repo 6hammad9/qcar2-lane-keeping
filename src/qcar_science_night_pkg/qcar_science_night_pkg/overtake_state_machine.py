@@ -4,6 +4,7 @@ from qcar_science_night_pkg.overtake_types import OvertakeDecision
 class OvertakeStateMachine:
     DRIVE = "DRIVE"
     WAIT = "WAIT_FOR_CLEAR"
+    PROBE = "LANE_PROBE"
     OVERTAKE = "OVERTAKE_LEFT"
     RETURN = "RETURN_RIGHT"
     ESTOP = "EMERGENCY_STOP"
@@ -15,10 +16,13 @@ class OvertakeStateMachine:
         left_clear_confirm_required=2,
         no_obstacle_confirm_required=15,
         right_clear_confirm_required=10,
+        flank_clear_confirm_required=4,
         return_confirm_required=30,
         min_overtake_steps=30,
         min_overtake_progress=0.80,
         min_return_progress=0.35,
+        probe_enabled=True,
+        probe_min_gap_m=0.50,
     ):
         self.state = self.DRIVE
         self.overtake_offset = float(overtake_offset)
@@ -27,6 +31,7 @@ class OvertakeStateMachine:
         self.left_clear_confirm_required = left_clear_confirm_required
         self.no_obstacle_confirm_required = no_obstacle_confirm_required
         self.right_clear_confirm_required = right_clear_confirm_required
+        self.flank_clear_confirm_required = flank_clear_confirm_required
         self.return_confirm_required = return_confirm_required
         # ``min_overtake_steps`` is retained as an API compatibility shim for
         # older launch files.  Scan callbacks are not vehicle motion and must
@@ -36,9 +41,20 @@ class OvertakeStateMachine:
         self.min_overtake_progress = float(min_overtake_progress)
         self.min_return_progress = float(min_return_progress)
 
+        # Lane probing, after IDEAM's LP state (Shu, Zhou & Zhang, T-ITS
+        # 2025, Sec. V-A2). Where a lane change is forbidden -- a curve, or
+        # both lanes blocked -- the car previously stopped dead and waited.
+        # It should instead keep closing on the obstacle under a gap bound,
+        # so it is already in position when a pass becomes legal. On this
+        # route the curvature gate is false over most of the lap, so
+        # "stop dead" meant stranding the car with a clear lane beside it.
+        self.probe_enabled = bool(probe_enabled)
+        self.probe_min_gap_m = float(probe_min_gap_m)
+
         self.obstacle_counter = 0
         self.left_clear_counter = 0
         self.right_clear_counter = 0
+        self.flank_clear_counter = 0
         self.no_obstacle_counter = 0
         self.return_counter = 0
         self.overtake_counter = 0
@@ -50,6 +66,7 @@ class OvertakeStateMachine:
         self.obstacle_counter = 0
         self.left_clear_counter = 0
         self.right_clear_counter = 0
+        self.flank_clear_counter = 0
         self.no_obstacle_counter = 0
         self.return_counter = 0
         self.overtake_counter = 0
@@ -85,6 +102,11 @@ class OvertakeStateMachine:
         else:
             self.right_clear_counter = 0
 
+        if status.flank_clear:
+            self.flank_clear_counter += 1
+        else:
+            self.flank_clear_counter = 0
+
     def start_overtake(self, progress=None):
         self.state = self.OVERTAKE
         self.overtake_counter = 0
@@ -93,6 +115,34 @@ class OvertakeStateMachine:
         self.return_start_progress = None
         self.wait_resume_overtake = False
         return OvertakeDecision(self.state, self.overtake_offset, True)
+
+    def probe_gap_allows(self, status):
+        """True while there is still room to creep forward.
+
+        The gap comes from the curvature-following corridor when it has one,
+        not from the wide front box. In a curve the wide box is looking at
+        the outside road edge, so its range is not the distance to anything
+        the car will actually reach; the corridor is the volume it will
+        sweep. Falling back to front_min keeps a status without corridor
+        data behaving sensibly.
+
+        front_narrow_min of -1.0 is the analyzer's "nothing detected", NOT a
+        zero-metre gap. Treating the sentinel as a distance would end the
+        probe every time the corridor happened to be empty, which is exactly
+        when it is safe to continue.
+        """
+        gap = None
+        if getattr(status, "front_narrow_count", 0) > 0:
+            narrow = float(getattr(status, "front_narrow_min", -1.0))
+            if narrow > 0.0:
+                gap = narrow
+        if gap is None:
+            front = float(status.front_min)
+            gap = front if front > 0.0 else None
+
+        if gap is None:
+            return True
+        return gap > self.probe_min_gap_m
 
     def update(
         self,
@@ -116,6 +166,9 @@ class OvertakeStateMachine:
         confirmed_right_clear = (
             self.right_clear_counter >= self.right_clear_confirm_required
         )
+        confirmed_flank_clear = (
+            self.flank_clear_counter >= self.flank_clear_confirm_required
+        )
 
         if status.emergency:
             self.state = self.ESTOP
@@ -126,19 +179,10 @@ class OvertakeStateMachine:
             self.wait_resume_overtake = False
             return OvertakeDecision(self.state, 999.0, False)
 
-        if self.state == self.DRIVE:
+        if self.state in (self.DRIVE, self.PROBE):
             if not confirmed_obstacle:
+                self.state = self.DRIVE
                 return OvertakeDecision(self.state, 0.0, True)
-
-            both_blocked = (
-                not status.left_clear
-                and not status.right_clear
-            )
-
-            if both_blocked:
-                self.state = self.WAIT
-                self.wait_resume_overtake = False
-                return OvertakeDecision(self.state, 999.0, False)
 
             can_avoid = (
                 confirmed_obstacle
@@ -149,6 +193,13 @@ class OvertakeStateMachine:
 
             if can_avoid:
                 return self.start_overtake(progress)
+
+            # A pass is not available: curve, blocked passing lane, or both.
+            # Creep forward instead of stopping, while a gap remains.
+            if self.probe_enabled and self.probe_gap_allows(status):
+                self.state = self.PROBE
+                self.wait_resume_overtake = False
+                return OvertakeDecision(self.state, 0.0, True)
 
             self.state = self.WAIT
             self.wait_resume_overtake = False
@@ -213,12 +264,17 @@ class OvertakeStateMachine:
             if (
                 confirmed_no_obstacle
                 and right_side_confirmed_empty
-                # A return is a lane change too.  Starting it on a curve can
-                # drive the reference across the inside road edge even when
-                # the original lane is clear at the current scan.  The MPC
-                # publishes this permission only for a sufficiently long,
-                # low-curvature preview of the recorded route.
-                and overtake_allowed
+                # The lane being vacated must be empty BESIDE and BEHIND the
+                # car, not merely ahead of it.  Every forward box reports
+                # clear the instant the lead draws level with the bumper --
+                # which is precisely when merging back is a collision.  This
+                # replaces a gate on overtake_allowed, which asked the wrong
+                # question: that is the MPC's curvature permission for
+                # STARTING a pass, false over most of this route, so it both
+                # stranded the car in the passing lane for whole curves and
+                # said nothing at all about whether the lead had been cleared.
+                and confirmed_flank_clear
+                and status.flank_clear
                 and yaw_stable
                 and pass_confirmed
                 and self._progress_since(
@@ -239,7 +295,15 @@ class OvertakeStateMachine:
             # MPC's return S-curve, producing an unsafe left/right oscillation.
             # With motion disabled, measured progress and the swept-corridor
             # estimate both freeze.  A clear scan resumes the same return.
-            if not status.right_clear and status.right_count >= 2:
+            #
+            # The flank is checked here for the same reason it gates entry:
+            # a lead that is still level with the car's tail is invisible to
+            # right_clear.  It stops mattering by itself as the offset
+            # collapses, because the corridor is then inside the car's own
+            # body and the analyzer stops reporting on it.
+            if (
+                not status.right_clear and status.right_count >= 2
+            ) or not status.flank_clear:
                 return OvertakeDecision(
                     self.state,
                     999.0,

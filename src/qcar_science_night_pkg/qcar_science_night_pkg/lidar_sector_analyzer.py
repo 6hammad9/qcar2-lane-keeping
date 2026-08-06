@@ -32,6 +32,11 @@ class LidarSectorAnalyzer:
         return_transition_length=0.54,
         return_outer_margin=0.12,
         return_inner_margin=0.20,
+        flank_x_min=-0.35,
+        flank_x_max=0.70,
+        flank_half_width=0.14,
+        flank_body_half_width=0.12,
+        min_flank_points=2,
     ):
         self.front_offset = math.radians(front_offset_deg)
         self.max_range = float(max_range)
@@ -92,7 +97,36 @@ class LidarSectorAnalyzer:
         ):
             raise ValueError("invalid swept-return-corridor geometry")
 
+        # The lane being vacated, sampled beside and behind the car.  Every
+        # other box starts ahead of the bumper, so all of them report clear
+        # the moment the vehicle being passed draws level -- which is the
+        # instant it is least safe to merge.  x_min is negative on purpose:
+        # the chassis is 0.425 m long with the scanner at its centre, so
+        # 0.22 m of car trails the measurement origin and a lead level with
+        # that tail is still a collision.
+        self.flank_x_min = float(flank_x_min)
+        self.flank_x_max = float(flank_x_max)
+        self.flank_half_width = float(flank_half_width)
+        self.flank_body_half_width = float(flank_body_half_width)
+        self.min_flank_points = int(min_flank_points)
+        if not (
+            self.flank_x_min < self.flank_x_max
+            and self.flank_half_width > 0.0
+            and self.flank_body_half_width > 0.0
+            and self.min_flank_points >= 1
+        ):
+            raise ValueError("invalid flank-corridor geometry")
+
     def scan_to_xy(self, scan_msg):
+        """Scan to (forward, left, range) triples in the vehicle frame.
+
+        Rearward returns are kept.  They were previously discarded here, so
+        half of a 360-degree scan was thrown away before any box could look
+        at it and nothing downstream could tell whether a vehicle being
+        passed was still beside the car.  This is inert for every pre-existing
+        consumer: the front, side, emergency and swept-return boxes all begin
+        at x >= 0.03 m and therefore never select a point this now admits.
+        """
         points = []
 
         for i, r in enumerate(scan_msg.ranges):
@@ -111,9 +145,6 @@ class LidarSectorAnalyzer:
 
             x = float(r * math.cos(rel))  # forward
             y = float(r * math.sin(rel))  # left positive
-
-            if x <= 0.0:
-                continue
 
             points.append((x, y, float(r)))
 
@@ -223,12 +254,39 @@ class LidarSectorAnalyzer:
 
         return np.asarray(selected, dtype=float)
 
+    def flank_corridor_points(self, points, lateral_shift_m, curvature):
+        """Ranges in the lane being vacated, alongside and behind the car.
+
+        ``lateral_shift_m`` is how far left of that lane the car currently
+        sits, so the corridor is centred ``-lateral_shift_m`` to the right and
+        bends with the route exactly as the front corridors do.
+
+        Returns ``None`` when the corridor would overlap the car's own body --
+        near the end of a return there is no longer a meaningful gap to
+        inspect, and sampling it would just measure the chassis.
+        """
+        shift = float(lateral_shift_m)
+        if not math.isfinite(shift):
+            return None
+        if shift - self.flank_half_width < self.flank_body_half_width:
+            return None
+
+        return self.corridor_points(
+            points,
+            self.flank_x_min,
+            self.flank_x_max,
+            self.flank_half_width,
+            curvature,
+            center_y=-shift,
+        )
+
     def analyze(
         self,
         scan_msg,
         return_lateral_shift_m=None,
         path_curvature=0.0,
         lateral_intent_m=0.0,
+        flank_lateral_shift_m=None,
     ):
         """``lateral_intent_m`` shifts the emergency corridor to where the
         car is going, positive left.
@@ -310,6 +368,15 @@ class LidarSectorAnalyzer:
             center_y=self.emergency_center_y + float(lateral_intent_m),
         )
 
+        if flank_lateral_shift_m is None:
+            flank_points = None
+        else:
+            flank_points = self.flank_corridor_points(
+                points,
+                flank_lateral_shift_m,
+                path_curvature,
+            )
+
         front_min = self.min_distance(front_points)
         left_min = self.min_distance(left_points)
         right_min = self.min_distance(right_points)
@@ -346,6 +413,18 @@ class LidarSectorAnalyzer:
             or (right_min > self.lane_clear_distance and right_min > 0)
         )
 
+        # A flank is clear when it is empty, not when what is in it is far
+        # away: distance is meaningless here because a lead exactly abeam is
+        # at nearly zero range and is the most dangerous case, not the safest.
+        if flank_points is None:
+            flank_min = -1.0
+            flank_count = 0
+            flank_clear = True
+        else:
+            flank_min = self.min_distance(flank_points)
+            flank_count = self.count_points(flank_points)
+            flank_clear = flank_count < self.min_flank_points
+
         return ObstacleStatus(
             obstacle_ahead=obstacle_ahead,
             emergency=emergency,
@@ -361,4 +440,7 @@ class LidarSectorAnalyzer:
             front_narrow_count=front_narrow_count,
             emergency_min=emergency_min,
             emergency_count=emergency_count,
+            flank_clear=flank_clear,
+            flank_min=flank_min,
+            flank_count=flank_count,
         )

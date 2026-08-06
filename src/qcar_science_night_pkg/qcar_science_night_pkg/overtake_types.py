@@ -26,6 +26,17 @@ class ObstacleStatus:
     emergency_min: float = -1.0
     emergency_count: int = 0
 
+    # The lane being vacated, measured ALONGSIDE and BEHIND the car rather
+    # than ahead of it. right_clear answers "is the lane I am merging into
+    # clear in front of me"; every forward box necessarily reports clear once
+    # the vehicle being passed is level with the bumper. This answers "am I
+    # actually past it yet". Defaults to clear so a status built without the
+    # measurement behaves as it did before; the distance backstop in
+    # OvertakeStateMachine.min_overtake_progress covers that case.
+    flank_clear: bool = True
+    flank_min: float = -1.0
+    flank_count: int = 0
+
 
 @dataclass(frozen=True)
 class OvertakeDecision:

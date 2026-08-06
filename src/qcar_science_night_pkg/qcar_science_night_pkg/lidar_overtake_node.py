@@ -49,9 +49,28 @@ class LidarOvertakeNode(Node):
         self.declare_parameter("path_spacing", 0.05)
         self.declare_parameter("path_point_count", 540)
         self.declare_parameter("max_progress_step_points", 20)
-        self.declare_parameter("min_overtake_progress_m", 0.80)
+        # Path distance the car must cover before a return may even be
+        # considered.  It has to span the whole encounter, not just the
+        # approach: the commit distance (overtake_start_min_distance_m, the
+        # range to the lead's NEAR face), plus the lead's own length, plus the
+        # 0.22 m of QCar that trails the scanner, plus margin.  At the former
+        # 0.80 m the return unlocked while the scanner was still short of the
+        # lead's rear face -- the car reached its widest point upstream of the
+        # obstacle and then merged back through it.
+        self.declare_parameter("min_overtake_progress_m", 1.65)
         self.declare_parameter("min_return_progress_m", 0.90)
-        self.declare_parameter("overtake_offset_m", 0.47)
+        # One lane (0.43 m) plus margin.  At 0.40 m a centred ROSbot cleared
+        # the QCar's flank by 0.40 - 0.096 - 0.118 = 0.19 m before tracking
+        # lag, and rather less after it.
+        self.declare_parameter("overtake_offset_m", 0.55)
+        # Flank corridor: the lane being vacated, sampled beside and behind.
+        # x_min is negative because the chassis is 0.425 m long with the
+        # scanner at its centre.
+        self.declare_parameter("flank_corridor_x_min_m", -0.35)
+        self.declare_parameter("flank_corridor_x_max_m", 0.70)
+        self.declare_parameter("flank_half_width_m", 0.14)
+        self.declare_parameter("flank_body_half_width_m", 0.12)
+        self.declare_parameter("min_flank_points", 2)
         self.declare_parameter("v2v_geometry_stale_sec", 0.5)
         self.declare_parameter("v2v_lead_body_radius_m", 0.20)
         self.declare_parameter("v2v_scan_association_tolerance_m", 0.12)
@@ -227,6 +246,27 @@ class LidarOvertakeNode(Node):
             if not 0.05 <= value <= 3.0:
                 raise ValueError(f"{name} must be in [0.05, 3.0] m")
 
+        # A pass is only over once the car's TAIL has cleared the lead's nose.
+        # Measured from the scanner that is the commit range plus the lead's
+        # length plus the QCar's rear overhang; below that the return unlocks
+        # while the two are still level.  The flank corridor is the primary
+        # guard, but it is a sensor and this is the arithmetic backstop, so
+        # say so loudly rather than failing closed on a live vehicle.
+        self.min_overtake_progress_m = float(gp("min_overtake_progress_m"))
+        minimum_safe_progress = self.overtake_start_min_distance + 0.60
+        if self.min_overtake_progress_m < minimum_safe_progress:
+            self.get_logger().error(
+                "min_overtake_progress_m=%.2f m is shorter than the encounter "
+                "it must span: overtake_start_min_distance_m=%.2f m + 0.60 m "
+                "of lead length and QCar rear overhang = %.2f m. The return "
+                "will unlock while the lead is still alongside."
+                % (
+                    self.min_overtake_progress_m,
+                    self.overtake_start_min_distance,
+                    minimum_safe_progress,
+                )
+            )
+
         self.analyzer = LidarSectorAnalyzer(
             front_offset_deg=float(gp("front_offset_deg")),
             # These bound what the node can EVER see. The front_stop_* and
@@ -301,6 +341,11 @@ class LidarOvertakeNode(Node):
             ),
             return_outer_margin=float(gp("return_outer_margin_m")),
             return_inner_margin=float(gp("return_inner_margin_m")),
+            flank_x_min=float(gp("flank_corridor_x_min_m")),
+            flank_x_max=float(gp("flank_corridor_x_max_m")),
+            flank_half_width=float(gp("flank_half_width_m")),
+            flank_body_half_width=float(gp("flank_body_half_width_m")),
+            min_flank_points=int(gp("min_flank_points")),
         )
 
         self.state_machine = OvertakeStateMachine(
@@ -309,9 +354,10 @@ class LidarOvertakeNode(Node):
             left_clear_confirm_required=1,
             no_obstacle_confirm_required=5,
             right_clear_confirm_required=3,
+            flank_clear_confirm_required=4,
             return_confirm_required=10,
             min_overtake_steps=70,
-            min_overtake_progress=float(gp("min_overtake_progress_m")),
+            min_overtake_progress=self.min_overtake_progress_m,
             min_return_progress=float(gp("min_return_progress_m")),
         )
 
@@ -698,6 +744,9 @@ class LidarOvertakeNode(Node):
                 front_narrow_count=status.front_narrow_count,
                 emergency_min=status.emergency_min,
                 emergency_count=status.emergency_count,
+                flank_clear=status.flank_clear,
+                flank_min=status.flank_min,
+                flank_count=status.flank_count,
             )
 
         return status
@@ -767,6 +816,11 @@ class LidarOvertakeNode(Node):
             return_lateral_shift_m=return_shift,
             path_curvature=path_curvature,
             lateral_intent_m=lateral_intent,
+            # Same displacement, opposite question: return_lateral_shift_m
+            # asks whether the lane ahead is clear to merge into, this asks
+            # whether the lead is still beside us.  None outside a pass, which
+            # correctly leaves the flank unmeasured and reported clear.
+            flank_lateral_shift_m=return_shift,
         )
 
         status, path_context, effective_front_stop_m, effective_emergency_stop_m = (
@@ -920,6 +974,8 @@ class LidarOvertakeNode(Node):
             f"emg={status.emergency} | "
             f"L={status.left_clear} | "
             f"R={status.right_clear} | "
+            f"FLANK={status.flank_clear} | "
+            f"flank_n={status.flank_count} | "
             f"allow_raw={self.allow_overtake} | "
             f"allow_final={overtake_allowed} | "
             f"yaw_stable={self.yaw_stable} | "

@@ -201,7 +201,7 @@ def ellipse_closest_point(
     return s, lat
 
 
-def ellipse_barrier(
+def ellipse_barrier_coefficients(
     *,
     station_m,
     lateral_m,
@@ -210,17 +210,27 @@ def ellipse_barrier(
     semi_major_m,
     semi_minor_m,
 ):
-    """Linearized DHOCBF value psi_0, Eq. (27).
+    """Tangent coefficients (A, B, C) of the linearized DHOCBF, Eq. (27).
 
-    Tangent to the ellipse at the point nearest the ego vehicle:
-
-        psi_0 = A*s + B*e_y + C
+        psi_0(s, e_y) = A*s + B*e_y + C
         A = b^2 (s_bar - s_o)
         B = a^2 (e_bar - e_yo)
 
-    Positive outside the ellipse, zero on it, negative inside. Linear in the
-    state, which is what keeps the MPC's feasible set convex -- the reason
-    the paper linearizes rather than using the ellipse directly.
+    where (s_bar, e_bar) is the point on the ellipse nearest the state the
+    barrier is linearized about.
+
+    The coefficients are the useful form, not the scalar value: an MPC needs
+    a LINEAR CONSTRAINT to stay convex, so it wants A, B and C to hand to the
+    solver. Evaluating the barrier at one point tells the optimizer nothing
+    about which direction to move.
+
+    Safe by construction: an ellipse lies entirely on one side of any of its
+    tangents, so the half-plane psi_0 >= 0 is contained in the true exterior.
+    The linearization can refuse a manoeuvre that was in fact safe; it cannot
+    admit one that was not.
+
+    Divide all three by hypot(A, B) for conditioning and the residual reads
+    directly in metres of clearance, without moving the boundary.
     """
     a = float(semi_major_m)
     b = float(semi_minor_m)
@@ -240,6 +250,32 @@ def ellipse_barrier(
     b_cbf = a * a * (l_bar - lo)
     c_cbf = -(a_cbf * s_bar + b_cbf * l_bar)
 
+    return a_cbf, b_cbf, c_cbf
+
+
+def ellipse_barrier(
+    *,
+    station_m,
+    lateral_m,
+    center_station_m,
+    center_lateral_m,
+    semi_major_m,
+    semi_minor_m,
+):
+    """Linearized DHOCBF value psi_0 at the linearization point itself.
+
+    Positive outside the ellipse, zero on it, negative inside. A convenience
+    over ``ellipse_barrier_coefficients``; use those directly when building
+    an MPC constraint.
+    """
+    a_cbf, b_cbf, c_cbf = ellipse_barrier_coefficients(
+        station_m=station_m,
+        lateral_m=lateral_m,
+        center_station_m=center_station_m,
+        center_lateral_m=center_lateral_m,
+        semi_major_m=semi_major_m,
+        semi_minor_m=semi_minor_m,
+    )
     return a_cbf * float(station_m) + b_cbf * float(lateral_m) + c_cbf
 
 

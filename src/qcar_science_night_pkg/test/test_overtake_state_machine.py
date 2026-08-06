@@ -11,7 +11,7 @@ from qcar_science_night_pkg.overtake_safety import (
 
 
 def status(*, obstacle=False, emergency=False, left=True, right=True,
-           front_count=0, left_count=0, right_count=0):
+           front_count=0, left_count=0, right_count=0, flank=True):
     return ObstacleStatus(
         obstacle_ahead=obstacle,
         emergency=emergency,
@@ -23,6 +23,8 @@ def status(*, obstacle=False, emergency=False, left=True, right=True,
         front_count=front_count,
         left_count=left_count,
         right_count=right_count,
+        flank_clear=flank,
+        flank_count=0 if flank else 6,
     )
 
 
@@ -32,6 +34,7 @@ def machine():
         left_clear_confirm_required=1,
         no_obstacle_confirm_required=2,
         right_clear_confirm_required=1,
+        flank_clear_confirm_required=1,
         min_overtake_progress=0.8,
         min_return_progress=0.3,
     )
@@ -66,19 +69,46 @@ def test_pass_and_return_require_measured_progress():
     assert decision.state == sm.DRIVE
 
 
-def test_return_waits_for_a_straight_path_preview():
+def test_return_waits_for_the_vacated_lane_beside_the_car():
     sm = machine()
     sm.update(status(obstacle=True, front_count=1), True, progress=10.0)
-    sm.update(status(), False, progress=10.5)
+    sm.update(status(flank=False), True, progress=10.5)
 
-    # The vehicle has travelled far enough and the original lane is clear,
-    # but a curve is not a safe place to begin changing right.
-    decision = sm.update(status(), False, progress=10.81)
+    # Far enough travelled, and every forward box says the original lane is
+    # clear -- because the lead is level with the car, where no forward box
+    # looks. The flank is the only measurement that covers it.
+    decision = sm.update(status(flank=False), True, progress=10.81)
     assert decision.state == sm.OVERTAKE
     assert decision.offset == sm.overtake_offset
 
     decision = sm.update(status(), True, progress=10.9)
     assert decision.state == sm.RETURN
+
+
+def test_return_is_not_gated_on_permission_to_start_a_pass():
+    """overtake_allowed answers "may I begin a pass here", which is false
+    over most of this route. Gating the return on it too stranded the car in
+    the passing lane for whole curves, and said nothing about whether the
+    lead had actually been cleared.
+    """
+    sm = machine()
+    sm.update(status(obstacle=True, front_count=1), True, progress=10.0)
+    sm.update(status(), False, progress=10.5)
+
+    decision = sm.update(status(), False, progress=10.81)
+    assert decision.state == sm.RETURN
+
+
+def test_a_lead_reappearing_alongside_freezes_a_committed_return():
+    sm = machine()
+    sm.update(status(obstacle=True, front_count=1), True, progress=10.0)
+    sm.update(status(), True, progress=10.5)
+    assert sm.update(status(), True, progress=10.81).state == sm.RETURN
+
+    decision = sm.update(status(flank=False), True, progress=10.9)
+    assert decision.state == sm.RETURN
+    assert decision.offset == 999.0
+    assert not decision.motion_enabled
 
 
 def test_far_right_returns_do_not_block_a_confirmed_clear_lane():

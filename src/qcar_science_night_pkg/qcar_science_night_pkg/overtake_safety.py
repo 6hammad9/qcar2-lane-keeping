@@ -207,6 +207,9 @@ def limit_status_for_path_context(
         front_narrow_count=status.front_narrow_count,
         emergency_min=status.emergency_min,
         emergency_count=status.emergency_count,
+        flank_clear=status.flank_clear,
+        flank_min=status.flank_min,
+        flank_count=status.flank_count,
     )
     return limited, context, effective_front, effective_emergency
 
@@ -354,6 +357,9 @@ def suppress_matched_nonblocking_v2v_lead(
         front_narrow_count=physical_status.front_narrow_count,
         emergency_min=physical_status.emergency_min,
         emergency_count=physical_status.emergency_count,
+        flank_clear=physical_status.flank_clear,
+        flank_min=physical_status.flank_min,
+        flank_count=physical_status.flank_count,
     )
     return filtered, True
 
