@@ -21,6 +21,185 @@ Two things below are out of date and will not work as written:
 
 ---
 
+# Quick Start — run the already-built implementation
+
+Use this if the workspace is **already built** and the map and route already
+exist on the car. Nothing here builds, maps, or records anything — for that,
+see [RUNBOOK.md](RUNBOOK.md) §3–4. This is the known-good configuration that
+ran continuous autonomous laps on 2026-08-03, tracking at 0.02–0.06 m.
+
+### Prerequisites
+
+| | |
+|---|---|
+| Target | `nvidia@192.168.0.53` |
+| Workspace | `~/qcar_v2v_ws` (already built with `colcon`) |
+| Map | `mapping_output/qcar_real_20260802-014755.pbstream` + `.yaml` |
+| Route | `mapping_output/my_route_loop.npy` (777 pts, 38.80 m) |
+| Localization | Cartographer pure-localization — **not** AMCL |
+
+Confirm those exist before starting:
+
+```bash
+ls ~/qcar_v2v_ws/mapping_output/qcar_real_20260802-014755.{pbstream,yaml} \
+   ~/qcar_v2v_ws/mapping_output/my_route_loop.npy
+```
+
+> **If you have just pulled new code, rebuild first** — the curvature corridor
+> needs both nodes at the same version:
+> ```bash
+> cd ~/qcar_v2v_ws && colcon build --symlink-install \
+>   --packages-select qcar_science_night_pkg && source install/setup.bash
+> ```
+
+### Step 0 — environment, in every terminal
+
+```bash
+cd ~/qcar_v2v_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=1
+```
+
+> Keep sessions alive across SSH drops, or an SSH hiccup kills the MPC
+> mid-lap. `tmux` was **not installed** on the car as of 2026-08-03 and `apt`
+> is broken there (do **not** run `apt --fix-broken` — it can pull or remove
+> NVIDIA packages). If `tmux new -s car` fails, use `nohup … &` instead and
+> stop nodes with `kill -INT` rather than `kill`.
+
+### Terminal 1 — localization, hardware, LiDAR
+
+```bash
+ros2 launch qcar2_nodes qcar2_cartographer_launch.py \
+  state_filename:=/home/nvidia/qcar_v2v_ws/mapping_output/qcar_real_20260802-014755.pbstream \
+  configuration_basename:=qcar2_2d_localization.lua \
+  resolution:=0.05
+```
+
+**This does NOT start the camera.** `enable_camera` defaults to `false`
+(`qcar2_launch.py`), and this launch includes that file without overriding it,
+so the RGB-D node is never spawned. Add `enable_camera:=true` if you want it.
+Localization needs only the LiDAR, so the known-good lap ran without it.
+
+If you do enable it, the node is named **`RealsenseCamera`**, not `rgbd`, and
+you must not also run `ros2 run qcar2_nodes rgbd` — two processes on one
+RealSense fail to open the device.
+
+Block until TF is up, or the MPC spams `TF unavailable`:
+
+```bash
+until timeout 3 ros2 run tf2_ros tf2_echo map base_link >/dev/null 2>&1; do sleep 2; done
+ros2 topic hz /scan     # expect ~10 Hz
+```
+
+If `map -> base_link` reports *"not part of the same tree"*, Cartographer has
+not relocalized. Put the car where mapping started and push it a metre by
+hand — static scans give it nothing to match against.
+
+### Terminal 2 — the controller
+
+```bash
+ros2 run qcar_science_night_pkg path_mpc --ros-args \
+  -p trajectory_file:=/home/nvidia/qcar_v2v_ws/mapping_output/my_route_loop.npy \
+  -p map_file:=/home/nvidia/qcar_v2v_ws/mapping_output/qcar_real_20260802-014755.yaml \
+  -p require_map_validation:=true \
+  -p require_amcl_quality:=false \
+  -p loop_path:=true \
+  -p target_laps:=999 \
+  -p path_spacing:=0.05 \
+  -p speed_limit_ceiling:=2.0 \
+  -p max_speed:=1.2 \
+  -p curve_speed:=0.70 \
+  -p startup_speed:=0.40 \
+  -p maneuver_speed:=0.30 \
+  -p max_decel:=1.5 \
+  -p brake_lookahead_m:=1.20 \
+  -p search_window_forward:=30 \
+  -p enable_reference_offsets:=false \
+  -p enable_v2v:=false
+```
+
+Wait for `Path/map validation: PASS`, `QCar MPC ready`, and
+`Start alignment accepted`. **The car stays still — that is correct.**
+`require_amcl_quality:=false` is mandatory: Cartographer publishes no
+`/amcl_pose`, so that gate can never pass.
+
+### Terminal 3 — arm it (this is what makes the car move)
+
+**Clear the track. Hand on the E-stop.**
+
+```bash
+PTS=$(python3 -c "import numpy as np; print(len(np.load('/home/nvidia/qcar_v2v_ws/mapping_output/my_route_loop.npy')))")
+
+ros2 run qcar_science_night_pkg lidar_overtake --ros-args \
+  -p path_point_count:=$PTS \
+  -p path_spacing:=0.05 \
+  -p front_offset_deg:=180.0 \
+  -p v2v_fusion_enable:=false \
+  -p lidar_max_range_m:=2.0 \
+  -p front_box_max_m:=0.90 \
+  -p emergency_box_max_m:=0.70 \
+  -p side_box_max_m:=0.70 \
+  -p lane_width_m:=0.43 \
+  -p emergency_half_width_m:=0.12 \
+  -p front_narrow_half_width_m:=0.16 \
+  -p min_front_narrow_points:=2 \
+  -p front_stop_straight_m:=0.90 \
+  -p emergency_stop_straight_m:=0.70 \
+  -p front_stop_curve_m:=0.45 \
+  -p emergency_stop_curve_m:=0.65
+```
+
+State goes `STARTUP_WAIT` → `DRIVE` and **the car moves**.
+
+### Stopping
+
+```bash
+pkill -x lidar_overtake
+```
+
+> **Do NOT rely on `ros2 topic pub --once /motion_enable ... false`.** It does
+> not stop the car. `lidar_overtake` republishes `/motion_enable` every cycle,
+> so a one-shot publish is overwritten within ~100 ms and the car re-arms
+> itself. Verified on the vehicle 2026-08-06: `/motion_enable` still read
+> `true` well after the one-shot was sent.
+>
+> Killing `lidar_overtake` is the reliable software stop — the MPC's
+> `behavior_data_fresh()` gate then fails and it halts with
+> `Motion blocked: LiDAR behavior heartbeat is missing or stale`.
+> **The E-stop remains the real stop.** Use it if anyone is near the car.
+
+### Confirm it is healthy
+
+```bash
+ros2 topic echo /path_curvature      # non-zero in a bend, sign flips between bends
+```
+
+In the `lidar_overtake` log, a good line looks like:
+
+```
+context=CURVE | state=DRIVE | obs=False | front=1.42 | narrow=-1.00 | nc=0 | kappa=+1.20
+```
+
+`kappa` stuck at `0.00` means `/path_curvature` is missing, the detection
+corridor is straight, and **obstacle detection in curves is back to its old
+blind behaviour** — check `path_mpc` is the redeployed build.
+
+### If something goes wrong
+
+| Symptom | Cause |
+|---|---|
+| Car never moves | Terminal 3 not running — it publishes `/motion_enable` |
+| MPC spams `TF unavailable` | Started Terminal 2 before Cartographer relocalized |
+| Car stops with **no message** in the MPC window | The safety layer stopped it silently — the reason is in the `lidar_overtake` window or `/drive_state` |
+| Car halts mid-lap, MPC still alive | `lidar_overtake` died; the MPC needs `/drive_state` and `/avoidance_offset` under 0.7 s old |
+| `Tracking safety stop: position_error=…` | Localization jump, see [HANDOFF.md](HANDOFF.md) §3.3 |
+
+Full failure catalogue and tuning: [RUNBOOK.md](RUNBOOK.md) §2–3.
+
+---
+
 # Overview
 
 This repository contains the complete software stack for autonomous indoor navigation on the **Quanser QCar** using **ROS2 Humble**.
