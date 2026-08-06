@@ -88,21 +88,21 @@ class LidarOvertakeNode(Node):
         self.declare_parameter("return_outer_margin_m", 0.12)
         self.declare_parameter("return_inner_margin_m", 0.20)
         # Obstacle/emergency lookahead. See the note at the assignment site.
-        self.declare_parameter("front_stop_straight_m", 0.90)
+        self.declare_parameter("front_stop_straight_m", 1.90)
         self.declare_parameter("emergency_stop_straight_m", 0.70)
-        self.declare_parameter("front_stop_curve_m", 0.45)
+        self.declare_parameter("front_stop_curve_m", 1.20)
         self.declare_parameter("emergency_stop_curve_m", 0.65)
-        self.declare_parameter("overtake_start_min_distance_m", 0.60)
+        self.declare_parameter("overtake_start_min_distance_m", 1.50)
         self.declare_parameter("hard_stop_front_distance_m", 0.40)
         # How far the adjacent lane must be clear before a pass is allowed.
         # Previously hardcoded at the analyzer's 0.75 m default.
-        self.declare_parameter("lane_clear_distance_m", 0.75)
+        self.declare_parameter("lane_clear_distance_m", 0.45)
         # Detection-box extents. These are the hard limit on what can be
         # seen at all; scale them with speed. Defaults preserve the previous
         # hardcoded values, which suit roughly 1.0 m/s and below.
-        self.declare_parameter("lidar_max_range_m", 2.0)
-        self.declare_parameter("front_box_max_m", 0.90)
-        self.declare_parameter("side_box_max_m", 0.70)
+        self.declare_parameter("lidar_max_range_m", 2.60)
+        self.declare_parameter("front_box_max_m", 2.20)
+        self.declare_parameter("side_box_max_m", 0.90)
         self.declare_parameter("emergency_box_max_m", 0.70)
         # Detection-box WIDTHS. The emergency half-width is what decides
         # whether an off-centre object is seen at all -- see the note at the
@@ -234,6 +234,41 @@ class LidarOvertakeNode(Node):
             gp("overtake_start_min_distance_m")
         )
         self.hard_stop_front_distance = float(gp("hard_stop_front_distance_m"))
+
+        # These four must stay ordered or the pass is geometrically doomed
+        # before it begins:
+        #
+        #   front_box_max_m           what the sensor may EVER report
+        #     > front_stop_straight_m   where an obstacle is declared
+        #       > overtake_start_min_distance_m   where the pass may commit
+        #         > lane_change_distance_m (0.90 m, in path_mpc)
+        #
+        # The last gap is the one that matters and the one that was wrong.
+        # The lateral S-curve needs lane_change_distance_m of travel to
+        # finish, so committing at 1.00 m against a 0.90 m ramp left the car
+        # still moving sideways as it drew level with the obstacle -- closest
+        # to it at the moment it was least displaced. That is the "it does
+        # not get far enough away from the thing it is crossing" behaviour,
+        # and no increase in overtake_offset_m fixes it, because the offset
+        # is never reached in time.
+        LANE_CHANGE_DISTANCE_M = 0.90     # mirrors path_mpc; different node
+        settle = self.overtake_start_min_distance - LANE_CHANGE_DISTANCE_M
+        if settle < 0.30:
+            self.get_logger().warn(
+                "overtake_start_min_distance_m="
+                f"{self.overtake_start_min_distance:.2f} m leaves only "
+                f"{settle:.2f} m to settle after the {LANE_CHANGE_DISTANCE_M:.2f} m "
+                "lane-change ramp. The car will still be moving sideways as "
+                "it passes. Raise it to at least "
+                f"{LANE_CHANGE_DISTANCE_M + 0.30:.2f} m."
+            )
+        if self.front_stop_straight_m <= self.overtake_start_min_distance:
+            raise ValueError(
+                f"front_stop_straight_m ({self.front_stop_straight_m:.2f}) must "
+                "exceed overtake_start_min_distance_m "
+                f"({self.overtake_start_min_distance:.2f}): an obstacle cannot "
+                "be committed to before it has been detected"
+            )
 
         for name, value in (
             ("front_stop_straight_m", self.front_stop_straight_m),
