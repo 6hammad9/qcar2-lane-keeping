@@ -70,18 +70,54 @@ def warp(img, reverse=False, out_shape=None):
     return cv2.warpPerspective(img, m, (BEV, BEV))
 
 
+MIN_PAINT_LEVEL = 95        # Otsu split below this is not paint
+MIN_PAINT_FRACTION = 0.004  # less bright area than this is noise
+MAX_PAINT_FRACTION = 0.30   # more than this is not markings
+MIN_CONTRAST = 18.0         # grey spread below this has no modes to split
+
+
 def threshold(bev):
     """Lane paint is brighter than the floor it is painted on.
 
     Otsu adapts to the ambient level, which matters because this lab's
-    lighting varies a lot across the loop. The fixed HSV band the old node
-    used ([0,0,170]-[180,45,255]) meant 'anything pale' and caught the walls;
-    here the warp has already removed the walls, so a brightness split on the
-    road surface alone is enough.
+    lighting varies a lot around the loop. But Otsu ALWAYS returns a
+    threshold: given a uniform grey patch with no markings in it at all, it
+    splits the sensor noise and hands back a binary image full of specks.
+    The sliding window then fits lines to that noise and the node reports a
+    confident lane where there is none -- the hallucinations seen on the car.
+
+    So the split has to be shown to be meaningful before it is trusted:
+
+      - the image must actually have two modes to separate (MIN_CONTRAST);
+      - the threshold must land where paint lives, not in the middle of a
+        grey ramp (MIN_PAINT_LEVEL);
+      - the bright area must be a plausible fraction of the view -- a few
+        specks is noise, a third of the frame is overexposure or a floor
+        lighter than the paint, and neither is a lane marking.
+
+    Failing any of these returns an EMPTY mask, which yields no fit and
+    mode=NONE. Reporting nothing is the correct answer when there is nothing
+    to see; it is the confident wrong answer that steers the car into a wall.
     """
     grey = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
     grey = cv2.GaussianBlur(grey, (5, 5), 0)
-    _, binary = cv2.threshold(grey, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Only the warped road surface carries information; the black corners the
+    # warp leaves behind would drag the statistics down.
+    road = grey[grey > 0]
+    if road.size < 0.05 * grey.size or float(road.std()) < MIN_CONTRAST:
+        return np.zeros_like(grey)
+
+    level, binary = cv2.threshold(
+        grey, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    if level < MIN_PAINT_LEVEL:
+        return np.zeros_like(grey)
+
+    fraction = float(np.count_nonzero(binary)) / float(binary.size)
+    if not MIN_PAINT_FRACTION <= fraction <= MAX_PAINT_FRACTION:
+        return np.zeros_like(grey)
+
     return cv2.morphologyEx(
         binary, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
     )
