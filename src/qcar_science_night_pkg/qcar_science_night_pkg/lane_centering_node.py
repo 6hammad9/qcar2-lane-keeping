@@ -51,6 +51,10 @@ class LaneCenteringNode(Node):
 
         self.declare_parameter("config_file", "")
         self.declare_parameter("image_timeout_sec", 0.75)
+        # Frames are arriving but none are decodable/usable. Deliberately
+        # longer than image_timeout_sec: this one is gated by frame_skip and
+        # by our own processing rate, neither of which indicates a fault.
+        self.declare_parameter("usable_image_timeout_sec", 2.0)
         config_path = resolve_config_path(
             str(self.get_parameter("config_file").value)
         )
@@ -61,8 +65,21 @@ class LaneCenteringNode(Node):
         if self.image_timeout_sec <= 0.0:
             raise ValueError("image_timeout_sec must be positive")
 
+        self.usable_image_timeout_sec = float(
+            self.get_parameter("usable_image_timeout_sec").value
+        )
+        if self.usable_image_timeout_sec < self.image_timeout_sec:
+            raise ValueError(
+                "usable_image_timeout_sec must be >= image_timeout_sec; "
+                "a shorter one would invalidate on our own processing rate, "
+                "which is the bug this split exists to fix"
+            )
+
         self.bridge = CvBridge()
         self.filtered_offset = 0.0
+        # Any frame arriving (camera liveness).
+        self.last_frame_time = None
+        # A frame that decoded to a usable strip (data quality).
         self.last_image_time = None
         self.last_valid = False
         self.frame_count = 0
@@ -105,23 +122,61 @@ class LaneCenteringNode(Node):
         self.publish_lane_state(0.0, False)
 
     def image_watchdog(self):
-        if self.last_image_time is None:
+        """Two independent failures, two independent timeouts.
+
+        These used to share one clock, and that clock only advanced on a
+        frame we had actually finished processing. With frame_skip=3 and a
+        camera delivering frames up to 0.16 s apart, the gap between
+        processed frames routinely exceeded image_timeout_sec, so a healthy
+        camera was reported stale and lane correction was switched off
+        mid-drive. Measured on the car: "Camera stale for 0.83s" against a
+        0.75 s limit while /camera/color_image was publishing at 15.7 Hz.
+
+        So: image_timeout_sec now governs camera liveness only, measured on
+        every arriving frame before any skipping. Whether those frames are
+        decodable is a separate question on a separate, longer timeout,
+        which preserves the original intent that a stream of malformed
+        images must not keep an old correction alive.
+        """
+        now = self.get_clock().now()
+
+        if self.last_frame_time is None:
             self.publish_lane_state(0.0, False)
             return
 
-        age = (
-            self.get_clock().now() - self.last_image_time
-        ).nanoseconds * 1e-9
-        if age > self.image_timeout_sec:
+        frame_age = (now - self.last_frame_time).nanoseconds * 1e-9
+        if frame_age > self.image_timeout_sec:
             if self.last_valid:
                 self.get_logger().warn(
-                    f"Camera stale for {age:.2f}s; disabling lane correction",
+                    f"Camera stale for {frame_age:.2f}s; "
+                    "disabling lane correction",
+                    throttle_duration_sec=1.0,
+                )
+            self.invalidate_lane()
+            return
+
+        if self.last_image_time is None:
+            self.invalidate_lane()
+            return
+
+        usable_age = (now - self.last_image_time).nanoseconds * 1e-9
+        if usable_age > self.usable_image_timeout_sec:
+            if self.last_valid:
+                self.get_logger().warn(
+                    f"No usable image for {usable_age:.2f}s "
+                    f"(camera alive, {frame_age:.2f}s since last frame); "
+                    "disabling lane correction",
                     throttle_duration_sec=1.0,
                 )
             self.invalidate_lane()
 
     # ------------------------------------------------------------------
     def image_callback(self, msg):
+        # Camera liveness, recorded before the skip gate. This must not be
+        # throttled by frame_skip or by how long our own pipeline takes --
+        # see image_watchdog.
+        self.last_frame_time = self.get_clock().now()
+
         self.frame_count += 1
         if self.frame_count % self.frame_skip:
             return
