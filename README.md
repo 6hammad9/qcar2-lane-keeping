@@ -137,19 +137,46 @@ ros2 run qcar_science_night_pkg lidar_overtake --ros-args \
   -p path_spacing:=0.05 \
   -p front_offset_deg:=180.0 \
   -p v2v_fusion_enable:=false \
-  -p lidar_max_range_m:=2.0 \
-  -p front_box_max_m:=0.90 \
+  -p lidar_max_range_m:=2.5 \
+  -p front_box_max_m:=1.80 \
   -p emergency_box_max_m:=0.70 \
-  -p side_box_max_m:=0.70 \
+  -p side_box_max_m:=0.90 \
   -p lane_width_m:=0.43 \
   -p emergency_half_width_m:=0.12 \
   -p front_narrow_half_width_m:=0.16 \
   -p min_front_narrow_points:=2 \
-  -p front_stop_straight_m:=0.90 \
+  -p front_stop_straight_m:=1.40 \
   -p emergency_stop_straight_m:=0.70 \
-  -p front_stop_curve_m:=0.45 \
-  -p emergency_stop_curve_m:=0.65
+  -p front_stop_curve_m:=0.90 \
+  -p emergency_stop_curve_m:=0.65 \
+  -p overtake_start_min_distance_m:=1.00 \
+  -p hard_stop_front_distance_m:=0.40 \
+  -p overtake_offset_m:=0.40
 ```
+
+**Why the boxes are this large.** `front_box_max_m` is a hard ceiling on what
+the node can ever see. At the old 0.90 m the car first saw an obstacle at
+0.90 m and had to commit to a pass by `overtake_start_min_distance_m` — a
+30 cm window, crossed in half a second while braking. It reliably ended up
+too close and then refused to overtake at all; the operator had to push the
+car forward by hand for a pass to start. Worse, the old
+`overtake_start_min_distance_m` (0.60) was **below** `lane_change_distance_m`
+(0.90), so it could commit to a manoeuvre it had no room to finish. Keep
+`overtake_start_min_distance_m >= lane_change_distance_m`.
+
+The MPC must be started with matching curvature limits or it will refuse to
+authorise the lane change:
+
+```
+-p overtake_max_curvature:=0.85     (default 0.40)
+-p overtake_mean_curvature:=0.40    (default 0.25)
+```
+
+Measured on this route: the pass point needs `max_curv` 0.571, which the
+offset path inflates to about 0.74, so 0.40 blocks it. 0.85 clears it while
+still refusing the loop seam, which previews at **3.728** — that one must
+stay blocked; the offset path there is degenerate and there is a wall at
+0.55 m.
 
 State goes `STARTUP_WAIT` → `DRIVE` and **the car moves**.
 
