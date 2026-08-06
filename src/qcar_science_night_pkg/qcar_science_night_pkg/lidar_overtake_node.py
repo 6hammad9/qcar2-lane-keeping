@@ -62,7 +62,7 @@ class LidarOvertakeNode(Node):
         # One lane (0.43 m) plus margin.  At 0.40 m a centred ROSbot cleared
         # the QCar's flank by 0.40 - 0.096 - 0.118 = 0.19 m before tracking
         # lag, and rather less after it.
-        self.declare_parameter("overtake_offset_m", 0.55)
+        self.declare_parameter("overtake_offset_m", 0.50)
         # Flank corridor: the lane being vacated, sampled beside and behind.
         # x_min is negative because the chassis is 0.425 m long with the
         # scanner at its centre.

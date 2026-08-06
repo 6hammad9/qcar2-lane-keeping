@@ -200,10 +200,21 @@ class QCar2PathMPC(Node):
         # Enable that behavior by default, but constrain every requested
         # shift with max_reference_offset below.
         self.declare_parameter("enable_reference_offsets", True)
-        self.declare_parameter("max_reference_offset", 0.65)
+        # Must stay below 1/kappa_max. Offsetting a path by d turns curvature
+        # kappa into kappa/(1 - kappa*d), so at d >= 1/kappa_max the offset
+        # path folds through its own centre and reports curvature in the tens.
+        # This route peaks at kappa = 1.88, so the limit is 1/1.88 = 0.53 and
+        # the old 0.65 default was already past it.
+        self.declare_parameter("max_reference_offset", 0.52)
         self.declare_parameter("behavior_timeout_sec", 1.0)
-        self.declare_parameter("overtake_max_curvature", 0.40)
-        self.declare_parameter("overtake_mean_curvature", 0.25)
+        # Where a pass may be attempted. Raising the offset and raising this
+        # gate pull against each other: the offset path needs
+        # atan(L * kappa/(1 - kappa*d)) of steer against a 0.50 rad limit, so
+        # at kappa = 1.0 a 0.50 m offset needs 97% of the limit while at
+        # kappa = 0.6 it needs 45%. Passing only on genuinely straight
+        # stretches is what buys the wider, more decisive lane change.
+        self.declare_parameter("overtake_max_curvature", 0.60)
+        self.declare_parameter("overtake_mean_curvature", 0.35)
         # Lane centering. See the assignment site for why 0.04 m could never
         # work and why the curvature gate is now a backstop, not the gate.
         self.declare_parameter("max_lane_offset_m", 0.12)
@@ -1581,6 +1592,22 @@ class QCar2PathMPC(Node):
                     -self.max_reference_offset,
                     self.max_reference_offset,
                 ))
+                # Say so when the clamp bites. lidar_overtake commands
+                # overtake_offset_m and this node caps it at
+                # max_reference_offset; they live in different nodes and
+                # nothing reconciles them. Launch with a larger offset than
+                # the cap and the car performs a visibly half-hearted lane
+                # change with no indication of why -- which is exactly how it
+                # was observed, passing with room to spare beside it.
+                if abs(self.avoidance_offset) > self.max_reference_offset + 1e-6:
+                    self.get_logger().warn(
+                        "Overtake offset clamped: lidar_overtake asked for "
+                        f"{abs(self.avoidance_offset):.3f} m, "
+                        f"max_reference_offset is {self.max_reference_offset:.3f} m. "
+                        "Raise max_reference_offset (keep it below "
+                        "1/kappa_max) or lower overtake_offset_m.",
+                        throttle_duration_sec=5.0,
+                    )
                 if self.overtake_transition_start_s is None:
                     self.overtake_transition_start_s = float(
                         self.path_cumulative_m[self.closest_idx]
