@@ -140,53 +140,95 @@ def sliding_window_fit(binary, nwindows=12, margin=70, minpix=40):
     return lf, rf, lp, rp
 
 
-def lane_offset(left_fit, right_fit, y_eval):
-    """Signed lateral offset in metres. Positive means the car is LEFT of
-    the lane centre, matching the y-left-positive convention used elsewhere.
+def joint_fit(left_px, right_px):
+    """One curve for both boundaries, separated by exactly the lane width.
 
-    With only one boundary, the other is inferred from the known lane width,
-    which is exactly the constraint the perspective view could not provide.
+    Fitting the two boundaries independently is what let the width collapse:
+    nothing tied them together, so when one search locked onto the real lane
+    line and the other onto the wall/floor junction, the two quadratics
+    converged and the region narrowed to a wedge. Observed in a hard left
+    bend, reported as BAD_WIDTH.
+
+    A lane's width is a known constant, so make it a constraint rather than
+    something to measure and then check:
+
+        left  points:  x     = A*y^2 + B*y + C
+        right points:  x - W = A*y^2 + B*y + C
+
+    Stack both sets into one least-squares solve for (A, B, C). Parallelism
+    and width then hold by construction, a distant wall line can no longer
+    pose as the second boundary, and whichever boundary is better observed
+    constrains the other -- which is what keeps a curve usable when only the
+    outer line stays inside the warp trapezoid.
+
+    Returns ``(fit, rms_px, n_points)``; ``fit`` is the LEFT boundary.
     """
-    half = LANE_WIDTH_PX / 2.0
-    if left_fit is not None and right_fit is not None:
-        lx = np.polyval(left_fit, y_eval)
-        rx = np.polyval(right_fit, y_eval)
-        centre = 0.5 * (lx + rx)
-        width_px = abs(rx - lx)
-        # Reject a fit pair that cannot be a lane.
-        if not 0.55 * LANE_WIDTH_PX < width_px < 1.6 * LANE_WIDTH_PX:
-            return None, "BAD_WIDTH", None, None
-        return (BEV / 2.0 - centre) * XM_PER_PIX, "BOTH", lx, rx
-    if left_fit is not None:
-        lx = np.polyval(left_fit, y_eval)
-        return (BEV / 2.0 - (lx + half)) * XM_PER_PIX, "LEFT", lx, lx + 2 * half
-    if right_fit is not None:
-        rx = np.polyval(right_fit, y_eval)
-        return (BEV / 2.0 - (rx - half)) * XM_PER_PIX, "RIGHT", rx - 2 * half, rx
-    return None, "NONE", None, None
+    ys, xs = [], []
+    if left_px is not None:
+        ys.append(left_px[1])
+        xs.append(left_px[0])
+    if right_px is not None:
+        ys.append(right_px[1])
+        xs.append(right_px[0] - LANE_WIDTH_PX)
+    if not ys:
+        return None, None, 0
+
+    y = np.concatenate(ys).astype(float)
+    x = np.concatenate(xs).astype(float)
+    if len(y) < 60 or len(np.unique(y)) < 6:
+        return None, None, len(y)
+
+    fit = np.polyfit(y, x, 2)
+    rms = float(np.sqrt(np.mean((np.polyval(fit, y) - x) ** 2)))
+    return fit, rms, len(y)
 
 
-def draw(frame, bev, left_fit, right_fit, offset, mode):
-    """Filled lane region, inverse-warped onto the camera image."""
+def lane_offset(fit, rms, n_points, mode_hint, y_eval, max_rms_px=45.0):
+    """Signed lateral offset in metres, positive when LEFT of lane centre.
+
+    ``rms`` is the joint fit's residual and is the honest confidence signal:
+    a fit spanning two unrelated lines cannot be explained by one curve at a
+    fixed separation, so its residual explodes. That replaces the old
+    width check, which could only fire once the damage was already in the
+    numbers.
+    """
+    if fit is None:
+        return None, "NONE", None, None, 0.0
+    if rms is None or rms > max_rms_px:
+        return None, "HIGH_RESIDUAL", None, None, 0.0
+
+    lx = np.polyval(fit, y_eval)
+    rx = lx + LANE_WIDTH_PX
+    centre = 0.5 * (lx + rx)
+    offset = (BEV / 2.0 - centre) * XM_PER_PIX
+
+    # 1.0 at a perfect fit with plenty of support, decaying with residual
+    # and with scarcity of evidence.
+    confidence = max(0.0, 1.0 - rms / max_rms_px) * min(1.0, n_points / 900.0)
+    return offset, mode_hint, lx, rx, confidence
+
+
+def draw(frame, bev, fit, offset, mode, confidence):
+    """Filled lane region, inverse-warped onto the camera image.
+
+    Only drawn when the result was ACCEPTED. Previously the region was drawn
+    whenever any fit existed, so a rejected frame showed a confident blue
+    lane next to the words "no lane" -- which is exactly backwards for a
+    debug view.
+    """
     overlay = np.zeros_like(bev)
     ys = np.linspace(0, BEV - 1, BEV).astype(int)
 
-    if left_fit is not None or right_fit is not None:
-        half = LANE_WIDTH_PX / 2.0
-        if left_fit is not None and right_fit is not None:
-            lx, rx = np.polyval(left_fit, ys), np.polyval(right_fit, ys)
-        elif left_fit is not None:
-            lx = np.polyval(left_fit, ys)
-            rx = lx + 2 * half
-        else:
-            rx = np.polyval(right_fit, ys)
-            lx = rx - 2 * half
-
+    if fit is not None and offset is not None:
+        lx = np.polyval(fit, ys)
+        rx = lx + LANE_WIDTH_PX
         pts = np.hstack([
             np.array([np.transpose(np.vstack([lx, ys]))]),
             np.array([np.flipud(np.transpose(np.vstack([rx, ys])))]),
         ])
-        cv2.fillPoly(overlay, np.int32([pts]), (255, 160, 40))
+        # Green when confident, amber when marginal.
+        colour = (255, 160, 40) if confidence > 0.5 else (60, 190, 255)
+        cv2.fillPoly(overlay, np.int32([pts]), colour)
         cx = 0.5 * (lx + rx)
         for i in range(0, BEV - 12, 24):
             cv2.line(overlay, (int(cx[i]), ys[i]),
@@ -204,6 +246,11 @@ def draw(frame, bev, left_fit, right_fit, offset, mode):
                 0.8, (0, 0, 0), 5)
     cv2.putText(out, f"mode = {mode}", (12, 68), cv2.FONT_HERSHEY_SIMPLEX,
                 0.8, (120, 255, 120), 2)
+    conf = f"confidence = {confidence:.2f}"
+    cv2.putText(out, conf, (12, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (0, 0, 0), 5)
+    cv2.putText(out, conf, (12, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (255, 200, 120), 2)
     return out
 
 
@@ -216,6 +263,11 @@ class LaneBEV(Node):
         self.n = 0
         self.offset_pub = self.create_publisher(Float32, "/lane_center_offset", 10)
         self.valid_pub = self.create_publisher(Bool, "/lane_center_valid", 10)
+        # The MPC scales its lane-centering authority by this, so a weak or
+        # single-boundary observation moves the car less than a clean one.
+        self.conf_pub = self.create_publisher(
+            Float32, "/lane_center_confidence", 10
+        )
         self.debug_pub = self.create_publisher(Image, "/lane_bev_debug", 10)
         self.bev_pub = self.create_publisher(Image, "/lane_bev_raw", 10)
         self.create_subscription(
@@ -236,15 +288,25 @@ class LaneBEV(Node):
 
         bev = warp(frame)
         binary = threshold(bev)
-        lf, rf, _lp, _rp = sliding_window_fit(binary)
-        # Evaluate near the bottom of the BEV, i.e. just ahead of the car.
-        offset, mode, _lx, _rx = lane_offset(lf, rf, BEV * 0.85)
+        lf, rf, lp, rp = sliding_window_fit(binary)
 
-        valid = offset is not None and abs(offset) < 0.5
+        hint = ("BOTH" if lp is not None and rp is not None
+                else "LEFT" if lp is not None
+                else "RIGHT" if rp is not None else "NONE")
+        fit, rms, npts = joint_fit(lp, rp)
+        # Evaluate near the bottom of the BEV, i.e. just ahead of the car.
+        offset, mode, _lx, _rx, confidence = lane_offset(
+            fit, rms, npts, hint, BEV * 0.85
+        )
+
+        valid = offset is not None and abs(offset) < 0.5 and confidence > 0.25
         self.offset_pub.publish(Float32(data=float(offset or 0.0)))
         self.valid_pub.publish(Bool(data=bool(valid)))
+        self.conf_pub.publish(
+            Float32(data=float(confidence if valid else 0.0))
+        )
 
-        vis = draw(frame, bev, lf, rf, offset, mode)
+        vis = draw(frame, bev, fit, offset, mode, confidence)
         try:
             self.debug_pub.publish(self.bridge.cv2_to_imgmsg(vis, "bgr8"))
             bev_vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
@@ -259,7 +321,7 @@ class LaneBEV(Node):
             cv2.imwrite(f"{self.save}_bev_{i}.png", bev_vis)
         if self.n % 20 == 0:
             self.get_logger().info(
-                f"mode={mode} offset="
+                f"mode={mode} conf={confidence:.2f} offset="
                 + ("none" if offset is None else f"{offset:+.4f} m")
             )
 

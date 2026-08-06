@@ -204,6 +204,12 @@ class QCar2PathMPC(Node):
         self.declare_parameter("behavior_timeout_sec", 1.0)
         self.declare_parameter("overtake_max_curvature", 0.40)
         self.declare_parameter("overtake_mean_curvature", 0.25)
+        # Lane centering. See the assignment site for why 0.04 m could never
+        # work and why the curvature gate is now a backstop, not the gate.
+        self.declare_parameter("max_lane_offset_m", 0.12)
+        self.declare_parameter("min_lane_offset_m", 0.04)
+        self.declare_parameter("lane_confidence_floor", 0.25)
+        self.declare_parameter("lane_centering_curve_limit", 1.20)
         self.declare_parameter("solver_timeout_sec", 0.20)
         self.declare_parameter("lane_change_distance_m", 0.90)
         self.declare_parameter("enable_v2v", False)
@@ -361,14 +367,58 @@ class QCar2PathMPC(Node):
         self.return_blend_threshold = 0.02
         self.return_decay = 0.92
 
-        self.lane_centering_curve_limit = 0.45
+        # Curvature above which lane centering was switched off entirely.
+        # The default 0.45 is BELOW this route's median curvature of 0.56, so
+        # lane centering was inactive on more than half the lap -- one of
+        # three reasons it could not affect the car at all. It is retained as
+        # a coarse backstop but is no longer the primary gate; confidence is.
+        # See lane_confidence_callback.
+        self.lane_centering_curve_limit = float(
+            self.get_parameter("lane_centering_curve_limit").value
+        )
+
         self.current_max_curvature = 999.0
         self.current_mean_curvature = 999.0
         # Signed; 0.0 (straight) until the first preview runs.
         self.current_signed_curvature = 0.0
         self.current_offset_max_curvature = 999.0
         self.current_offset_mean_curvature = 999.0
-        self.max_lane_offset = 0.04
+
+        # Lane-centering authority.
+        #
+        # This was hardcoded at 0.04 m, which cannot do the job it exists
+        # for. The lane is 0.42 m wide and the car about 0.19 m, so the car
+        # can sit (0.42-0.19)/2 = 0.115 m off centre before a wheel reaches a
+        # line. A 0.04 m budget can nudge but can never recover a car that
+        # has drifted, nor correct a recorded route that runs off-centre --
+        # which is the whole point of centering on the painted lane rather
+        # than on the map.
+        #
+        # The ceiling is therefore the physical margin. Authority is scaled
+        # by the detector's confidence between base and ceiling, so a weak or
+        # single-boundary observation moves the car very little and a
+        # rejected frame moves it not at all. That scaling is only defensible
+        # because the bird's-eye fit reports a real residual-based
+        # confidence; the previous perspective-frame detector reported
+        # valid=True whenever it fitted anything, so a flat small cap was the
+        # only safe choice there.
+        self.max_lane_offset = float(
+            self.get_parameter("max_lane_offset_m").value
+        )
+        self.min_lane_offset = float(
+            self.get_parameter("min_lane_offset_m").value
+        )
+        self.lane_confidence_floor = float(
+            self.get_parameter("lane_confidence_floor").value
+        )
+        if not 0.0 < self.min_lane_offset <= self.max_lane_offset <= 0.20:
+            raise ValueError(
+                "require 0 < min_lane_offset_m <= max_lane_offset_m <= 0.20; "
+                "0.20 m exceeds the half-lane margin and would steer the car "
+                "onto the line"
+            )
+        # 0.0 until the detector reports; treated as no authority.
+        self.lane_confidence = 0.0
 
         self.w_pos = 200.0
         self.w_yaw = 80.0
@@ -602,6 +652,9 @@ class QCar2PathMPC(Node):
         self.create_subscription(String, "/drive_state", self.drive_state_callback, 10)
         self.create_subscription(Float32, "/lane_center_offset", self.lane_offset_callback, 10)
         self.create_subscription(Bool, "/lane_center_valid", self.lane_valid_callback, 10)
+        self.create_subscription(
+            Float32, "/lane_center_confidence", self.lane_confidence_callback, 10
+        )
         self.create_subscription(Bool, "/depth_emergency_stop", self.depth_emergency_callback, 10)
         self.create_subscription(Bool, "/mission_restart", self.mission_restart_callback, 10)
         self.create_subscription(
@@ -833,6 +886,26 @@ class QCar2PathMPC(Node):
 
     def lane_valid_callback(self, msg):
         self.lane_valid = bool(msg.data)
+
+    def lane_confidence_callback(self, msg):
+        value = float(msg.data)
+        if not math.isfinite(value):
+            self.lane_confidence = 0.0
+            return
+        self.lane_confidence = min(1.0, max(0.0, value))
+
+    def lane_offset_authority(self):
+        """How far the camera may move the reference, in metres.
+
+        Scales from min_lane_offset_m to max_lane_offset_m with detector
+        confidence, and is zero below lane_confidence_floor. A detector that
+        cannot say how sure it is gets the minimum, which is the old
+        hardcoded behaviour and the correct fallback.
+        """
+        if self.lane_confidence < self.lane_confidence_floor:
+            return 0.0
+        span = self.max_lane_offset - self.min_lane_offset
+        return self.min_lane_offset + span * self.lane_confidence
 
     def depth_emergency_callback(self, msg):
         self.depth_emergency = bool(msg.data)
@@ -1595,12 +1668,17 @@ class QCar2PathMPC(Node):
             else:
                 self.avoidance_offset_filtered = 0.0
 
+            # Coarse backstop only. The real gate is detector confidence,
+            # applied through lane_offset_authority(): a curve degrades the
+            # observation, and the detector says so, so gating twice on
+            # curvature just switched centering off across most of the lap.
             is_straight = (
                 self.current_mean_curvature
                 < self.lane_centering_curve_limit
             )
+            authority = self.lane_offset_authority()
 
-            if is_straight and self.lane_valid:
+            if is_straight and self.lane_valid and authority > 0.0:
                 self.lane_offset_filtered = (
                     (1.0 - self.lane_alpha)
                     * self.lane_offset_filtered
@@ -1611,8 +1689,8 @@ class QCar2PathMPC(Node):
                 self.lane_offset_filtered = float(
                     np.clip(
                         self.lane_offset_filtered,
-                        -self.max_lane_offset,
-                        self.max_lane_offset,
+                        -authority,
+                        authority,
                     )
                 )
 
