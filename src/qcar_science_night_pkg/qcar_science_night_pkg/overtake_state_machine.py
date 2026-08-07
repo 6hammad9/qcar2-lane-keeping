@@ -23,6 +23,7 @@ class OvertakeStateMachine:
         min_return_progress=0.35,
         probe_enabled=True,
         probe_min_gap_m=0.50,
+        flank_override_progress=1.20,
     ):
         self.state = self.DRIVE
         self.overtake_offset = float(overtake_offset)
@@ -50,6 +51,17 @@ class OvertakeStateMachine:
         # "stop dead" meant stranding the car with a clear lane beside it.
         self.probe_enabled = bool(probe_enabled)
         self.probe_min_gap_m = float(probe_min_gap_m)
+
+        # Distance past a completed pass after which the flank corridor stops
+        # being allowed to veto the merge.  The corridor cannot tell a lead
+        # from scenery, and this course has walls inside the band it samples,
+        # so on the vehicle it latched at flank_count=55 and never released.
+        # A lead that was ahead at the commit point cannot still be alongside
+        # after the car has driven min_overtake_progress plus this much
+        # further, so beyond that the corridor is reporting on the world, not
+        # on traffic, and its veto is unsound.  The front box, the emergency
+        # corridor and the MPC barrier all remain in force.
+        self.flank_override_progress = float(flank_override_progress)
 
         self.obstacle_counter = 0
         self.left_clear_counter = 0
@@ -106,6 +118,18 @@ class OvertakeStateMachine:
             self.flank_clear_counter += 1
         else:
             self.flank_clear_counter = 0
+
+    def _flank_veto_expired(self, progress):
+        """True once the flank corridor can no longer be seeing the lead.
+
+        Distance is measured from the commit point, so this is the length of
+        the whole encounter plus a margin.  Past it the only things the
+        corridor can be reporting are static, and a static return beside the
+        car is a wall, not a reason to stay in the passing lane forever.
+        """
+        return self._progress_since(
+            self.overtake_start_progress, progress
+        ) >= self.min_overtake_progress + self.flank_override_progress
 
     def start_overtake(self, progress=None):
         self.state = self.OVERTAKE
@@ -273,8 +297,10 @@ class OvertakeStateMachine:
                 # STARTING a pass, false over most of this route, so it both
                 # stranded the car in the passing lane for whole curves and
                 # said nothing at all about whether the lead had been cleared.
-                and confirmed_flank_clear
-                and status.flank_clear
+                and (
+                    (confirmed_flank_clear and status.flank_clear)
+                    or self._flank_veto_expired(progress)
+                )
                 and yaw_stable
                 and pass_confirmed
                 and self._progress_since(
@@ -301,13 +327,34 @@ class OvertakeStateMachine:
             # right_clear.  It stops mattering by itself as the offset
             # collapses, because the corridor is then inside the car's own
             # body and the analyzer stops reporting on it.
+            flank_blocks_merge = (
+                not status.flank_clear
+                and not self._flank_veto_expired(progress)
+            )
             if (
                 not status.right_clear and status.right_count >= 2
-            ) or not status.flank_clear:
+            ) or flank_blocks_merge:
+                # Hold the passing lane and KEEP DRIVING rather than braking.
+                # Whatever blocks a merge is alongside or behind the car, and
+                # no amount of braking clears it -- only forward travel does.
+                # Stopping here therefore cannot resolve into anything: it was
+                # measured stuck at flank_count=55 with motion disabled and no
+                # exit, because the flank corridor had settled on the static
+                # right-hand wall, which never moves. It sat in the passing lane
+                # indefinitely and never returned to DRIVE.
+                #
+                # Commanding the full offset rather than 999.0 also preserves
+                # what the previous stop-in-place was protecting: the lateral
+                # command stays where the car already is, so the MPC's return
+                # S-curve is never reversed mid-flight, which is the left/right
+                # oscillation that motivated stopping in the first place.
+                # Re-anchoring progress keeps min_return_progress measured from
+                # the point the merge actually begins.
+                self.return_start_progress = progress
                 return OvertakeDecision(
                     self.state,
-                    999.0,
-                    False,
+                    self.overtake_offset,
+                    True,
                 )
 
             self.return_counter += 1

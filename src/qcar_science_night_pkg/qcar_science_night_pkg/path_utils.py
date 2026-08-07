@@ -34,7 +34,18 @@ class PathUtils:
             ])
 
         else:
-            data = data[:, 0:4]
+            # Recompute rather than trust the stored column. Route files
+            # written by the recorder carry an unsigned, twice-finite-
+            # differenced curvature, which is the wrong sign convention for
+            # feasible_overtake_offset and signed_curvature_preview and is
+            # dominated by recording noise besides. The geometry in columns
+            # 0-1 is authoritative; column 3 is derived from it.
+            data = np.column_stack([
+                data[:, 0],
+                data[:, 1],
+                data[:, 2],
+                PathUtils.compute_curvature(data[:, 0:2]),
+            ])
 
         data[:, 2] = np.unwrap(data[:, 2])
 
@@ -67,27 +78,95 @@ class PathUtils:
             curvature
         ])
 
+    # Exactly one @staticmethod.  Doubling it wraps the descriptor in itself,
+    # and the attribute access below then yields the inner staticmethod
+    # object rather than the function.  That object is callable from Python
+    # 3.10 onward, so the mistake passes on a modern dev machine and raises
+    # TypeError on the car's Python 3.8 -- where it takes out route loading,
+    # and with it the whole MPC.
     @staticmethod
-    def compute_curvature(xy):
-        x = xy[:, 0]
-        y = xy[:, 1]
+    def _fit_derivative_kernel(window, polyorder, deriv):
+        """Convolution kernel for a derivative of a local polynomial fit.
 
-        dx = np.gradient(x)
-        dy = np.gradient(y)
+        Savitzky-Golay differentiation: least-squares fit a polynomial over
+        ``window`` samples and differentiate that, instead of differencing
+        the samples themselves.  Same cost (one convolution), far less noise
+        amplification.
+        """
+        half = window // 2
+        t = np.arange(-half, half + 1, dtype=float)
+        design = np.vander(t, polyorder + 1, increasing=True)
+        coefficients = np.linalg.pinv(design)[deriv]
+        return coefficients * float(math.factorial(deriv))
 
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
+    @staticmethod
+    def compute_curvature(xy, window=15, polyorder=3):
+        """Signed path curvature, positive for a left turn.
 
-        denom = np.power(
-            dx * dx + dy * dy,
-            1.5
+        **Signed** because a lateral offset does not treat the two bend
+        directions alike: offsetting left shrinks ``1 - kappa*d`` on a left
+        bend, tightening the passing line, and grows it on a right bend,
+        loosening it.  ``feasible_overtake_offset`` and
+        ``signed_curvature_preview`` both depend on that distinction and were
+        previously handed magnitudes, so every right-hand bend -- 23% of this
+        route -- was scored as though passing left made it tighter.
+        Consumers that want magnitude already take ``abs()`` at the call site
+        (the speed limiter, and ``overtake_curvature_preview``).
+
+        **Fitted** rather than finite-differenced because ``np.gradient``
+        applied twice to 5 cm waypoints returns noise rather than geometry.
+        This route crosses itself, which makes that measurable: waypoints 190
+        and 303 are 1.8 cm apart on the same piece of floor and the old
+        estimator gave them kappa +1.46 and -0.31 -- opposite directions of
+        turn.  Median disagreement across all 114 such pairs was 0.33 1/m
+        against a passing-width decision threshold of 0.98, so the gate was
+        mostly measuring recording noise.
+        """
+        points = np.asarray(xy, dtype=float)
+        x, y = points[:, 0], points[:, 1]
+        n = len(points)
+
+        window = int(window)
+        if window % 2 == 0:
+            window += 1
+        # Degrade gracefully on paths shorter than the fit window.
+        window = max(5, min(window, n if n % 2 else n - 1))
+        polyorder = int(min(polyorder, window - 2))
+
+        half = window // 2
+        # A closed route must wrap or the seam gets edge-clamped curvature;
+        # an open one has no far side to borrow from.
+        closed = bool(
+            np.hypot(x[0] - x[-1], y[0] - y[-1])
+            <= 2.0 * np.median(np.hypot(np.diff(x), np.diff(y)))
+        )
+        pad = "wrap" if closed else "edge"
+        xp = np.pad(x, half, mode=pad)
+        yp = np.pad(y, half, mode=pad)
+
+        first = PathUtils._fit_derivative_kernel(window, polyorder, 1)
+        second = PathUtils._fit_derivative_kernel(window, polyorder, 2)
+
+        # np.convolve reverses the kernel; correlation is what we want.
+        dx = np.convolve(xp, first[::-1], mode="valid")
+        dy = np.convolve(yp, first[::-1], mode="valid")
+        ddx = np.convolve(xp, second[::-1], mode="valid")
+        ddy = np.convolve(yp, second[::-1], mode="valid")
+
+        # Guard only genuinely coincident waypoints. The floor has to be
+        # relative: this denominator scales as (waypoint spacing)^3, so a
+        # fixed one silently rescales the answer on any path finer than it
+        # assumed. At 0.05 m spacing it is 1.2e-4 and the old absolute 1e-6
+        # never bit; at 0.008 m it is 4.9e-7 and clamping there halved every
+        # curvature on the path.
+        speed_squared = dx * dx + dy * dy
+        typical = float(np.median(speed_squared))
+        speed_squared = np.maximum(
+            speed_squared,
+            1e-6 * typical if typical > 0.0 else 1e-12,
         )
 
-        denom[denom < 1e-6] = 1e-6
-
-        curvature = np.abs(
-            dx * ddy - dy * ddx
-        ) / denom
+        curvature = (dx * ddy - dy * ddx) / np.power(speed_squared, 1.5)
 
         return np.nan_to_num(
             curvature,
@@ -562,3 +641,93 @@ class PathUtils:
             points[valid, 2] = np.arctan2(dy[valid], dx[valid])
 
         return points.reshape(-1)
+
+
+def feasible_overtake_offset(
+        curvature,
+        start_idx,
+        horizon,
+        closed_path,
+        min_offset,
+        max_offset,
+        step,
+        kappa_limit,
+        allow_right=False,
+        percentile=100.0):
+    """Widest lane offset that stays steerable over the maneuver.
+
+    Positive is left.  Returns 0.0 when no offset works.
+
+    The road rule is two lanes, drive right, overtake left, so the search is
+    left-only by default and ``allow_right`` stays off on the road.
+
+    What this changes versus gating on one fixed offset is the WIDTH.  A pass
+    does not need the full offset, it needs enough to clear the obstacle.
+    Offsetting a path sideways scales its curvature by 1/(1 - kappa*d), and
+    on this route -- 72% left-hand bends, minimum radius 0.53 m -- a full
+    0.68 m offset drives that denominator towards zero on every tight bend,
+    so the passing lane folds into a cusp and the pass was refused outright.
+    Searching downward from ``max_offset`` instead takes the widest berth the
+    geometry actually supports, which is what turns a single passable stretch
+    into several (measured 4.0% of the lap at fixed width against 22.4%
+    adaptive, and 1 zone against 6).
+
+    The hairpins remain genuinely impassable: at radius 0.53 m an inside pass
+    of even 0.35 m leaves 0.18 m of radius.  No parameter fixes that; only a
+    route with gentler corners does.
+
+    ``percentile`` selects the statistic taken over the maneuver window.  At
+    the default 100.0 it is the maximum, which is what the fixed-width gate
+    used and what every existing caller still gets.  The maximum makes the
+    whole window only as passable as its single worst waypoint, and on a
+    recorded route that waypoint is usually an artifact: the curvature fit
+    spans 0.75 m, so one genuinely tight metre of road shows up in ~15
+    consecutive samples, whereas a lone spike does not.  Requiring instead
+    that 95% of the window be steerable keeps real corners out (they are
+    broad in the window) while no longer letting one sample veto 2.75 m of
+    otherwise open road -- measured on this route, 35.7% of the lap passable
+    at max against 47.6% at p95, and 2 full-maneuver stretches against 3.
+    """
+    k = np.asarray(curvature, dtype=float).reshape(-1)
+    if len(k) == 0 or horizon <= 0 or step <= 0.0:
+        return 0.0
+    if not (0.0 < min_offset <= max_offset) or kappa_limit <= 0.0:
+        return 0.0
+    percentile = float(percentile)
+    if not 50.0 <= percentile <= 100.0:
+        raise ValueError("percentile must be in [50, 100]")
+
+    start_idx = int(np.clip(start_idx, 0, len(k) - 1))
+    indices = start_idx + np.arange(int(horizon), dtype=int)
+    if closed_path:
+        indices %= len(k)
+    else:
+        indices = np.minimum(indices, len(k) - 1)
+
+    window = k[indices]
+    if not np.all(np.isfinite(window)):
+        return 0.0
+
+    width = float(max_offset)
+    sides = (1.0, -1.0) if allow_right else (1.0,)
+    while width >= float(min_offset) - 1e-9:
+        for side in sides:
+            offset = side * width
+            denominator = 1.0 - window * offset
+            # Near-zero denominator is the cusp: the offset path is
+            # degenerate there, not merely tight.
+            # A cusp is disqualifying wherever it appears, so this stays an
+            # any() regardless of ``percentile``: it is a degeneracy of the
+            # offset geometry, not a noisy sample to be averaged out.
+            if np.any(np.abs(denominator) < 1e-3):
+                continue
+            steering = np.abs(window / denominator)
+            demand = (
+                np.max(steering)
+                if percentile >= 100.0
+                else float(np.percentile(steering, percentile))
+            )
+            if demand <= kappa_limit:
+                return float(offset)
+        width -= float(step)
+    return 0.0

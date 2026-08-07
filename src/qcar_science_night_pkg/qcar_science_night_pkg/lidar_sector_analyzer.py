@@ -19,7 +19,7 @@ class LidarSectorAnalyzer:
         emergency_x_max=0.40,
         emergency_half_width=0.12,
         emergency_center_y=0.0,
-        front_narrow_half_width=0.16,
+        front_narrow_half_width=0.20,
         max_corridor_curvature=2.0,
         overtake_start_distance=0.75,
         emergency_distance=0.40,

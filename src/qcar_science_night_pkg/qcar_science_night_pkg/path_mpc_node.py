@@ -18,7 +18,10 @@ from qcar_science_night_pkg.path_map_validator import (
     format_report,
     validate_trajectory_against_map,
 )
-from qcar_science_night_pkg.path_utils import PathUtils
+from qcar_science_night_pkg.path_utils import (
+    PathUtils,
+    feasible_overtake_offset,
+)
 
 
 def path_curvature_from_xy(xy, closed_path=False):
@@ -205,7 +208,7 @@ class QCar2PathMPC(Node):
         # path folds through its own centre and reports curvature in the tens.
         # This route peaks at kappa = 1.88, so the limit is 1/1.88 = 0.53 and
         # the old 0.65 default was already past it.
-        self.declare_parameter("max_reference_offset", 0.52)
+        self.declare_parameter("max_reference_offset", 0.68)
         self.declare_parameter("behavior_timeout_sec", 1.0)
         # Where a pass may be attempted. Raising the offset and raising this
         # gate pull against each other: the offset path needs
@@ -213,8 +216,83 @@ class QCar2PathMPC(Node):
         # at kappa = 1.0 a 0.50 m offset needs 97% of the limit while at
         # kappa = 0.6 it needs 45%. Passing only on genuinely straight
         # stretches is what buys the wider, more decisive lane change.
-        self.declare_parameter("overtake_max_curvature", 0.60)
-        self.declare_parameter("overtake_mean_curvature", 0.35)
+        # The RAW limits are looser than they look, twice over. First, the
+        # gate also requires the PASSING-lane curvature kappa/(1 - kappa*d)
+        # to clear the same limit, and at d = 0.68 a raw 1.20 caps nominal
+        # LEFT-bend kappa near 0.65 (right-benders relax instead: the offset
+        # lane is the outside of the bend). Second, the physical ceiling is
+        # far higher: tan(0.50 rad steer)/0.256 m wheelbase tracks kappa up
+        # to ~2.1, so 1.20 on the offset lane uses about half the steering
+        # authority at maneuver speed. At the former 0.90/0.50, applied over
+        # the full maneuver-length preview, the pass was legal at exactly one
+        # spot on this route.
+        self.declare_parameter("overtake_max_curvature", 1.20)
+        self.declare_parameter("overtake_mean_curvature", 0.70)
+        # How far ahead the permission gate looks, in metres of route. It
+        # previously looked N=25 MPC steps ahead -- 1.25 m at 0.05 m spacing,
+        # against a maneuver that is ~2.75 m long (0.90 m ramp + 1.85 m
+        # committed pass). A pass could therefore be approved at a flat spot
+        # with a hairpin 1.5 m downstream, and the car entered curves
+        # mid-pass; conversely the gate re-blocked at spots a metre before a
+        # long straight. The window must cover the distance the car is
+        # actually committed to spending in the passing lane.
+        self.declare_parameter("overtake_preview_distance_m", 2.75)
+        # Smallest offset that still clears a ROSbot: half its width plus half
+        # the QCar plus margin.  A pass narrower than this is not worth doing.
+        self.declare_parameter("min_overtake_offset_m", 0.35)
+        self.declare_parameter("overtake_offset_search_step_m", 0.03)
+        # Steering ceiling for the PASSING lane.  tan(0.50 rad)/0.256 m = 2.13
+        # is the hard tracking limit; 1.75 needs 0.421 rad, keeping 16% of
+        # steering in reserve for tracking error.
+        #
+        # Raised from 1.50 once the curvature feeding this stopped being
+        # noise (see PathUtils.compute_curvature).  At 1.50 the top-left
+        # section of the route was passable over 8% of its length; the
+        # measured requirement there is a passing-line curvature just above
+        # 1.50, so the old limit was refusing it by a few hundredths while
+        # the estimator's own error was 0.33.  At 1.75 that section reaches
+        # 46%.  Both hairpins stay refused, which is correct: they need 2.4
+        # and above, past what the car can steer at all.
+        # Raised again to 2.00 (0.472 rad, 6% steering reserve) together with
+        # the percentile statistic below.  These two are one change: with the
+        # window scored at p95 the limit is no longer being asked to absorb a
+        # single outlier sample, so the reserve that used to cover estimator
+        # error can be spent on road instead.  Measured over the lap:
+        # 35.7% passable at (1.75, max), 47.6% at (2.00, p95).
+        self.declare_parameter("overtake_kappa_limit", 2.00)
+        # Fraction of the maneuver window that must be steerable in the
+        # passing lane.  See feasible_overtake_offset; 100.0 restores the
+        # previous worst-waypoint rule.
+        self.declare_parameter("overtake_curvature_percentile", 95.0)
+        # Two lanes, drive right, overtake left.  Passing on the right is a
+        # road-rule violation and stays off; it exists only as an escape hatch
+        # for a closed course with no oncoming traffic.
+        self.declare_parameter("allow_right_side_overtake", False)
+        # Route distance the passing lane must be drivable over, measured
+        # from the commit point.  This has to span the whole time the width
+        # is held, because lidar_overtake FREEZES the committed width on
+        # entering OVERTAKE_LEFT and will not renegotiate it until the car is
+        # back in its own lane (see allowed_offset_callback).  So the correct
+        # span is commit -> back-in-lane:
+        #
+        #     min_overtake_progress_m (1.85, commit until a return may start)
+        #   + min_return_progress_m   (1.70, the merge S-curve)
+        #   = 3.55 m
+        #
+        # At the previous 1.85 m the gate validated only the first half.  The
+        # car committed on checked geometry, carried 0.62 m of offset into a
+        # section that was never checked, and the passing lane folded there:
+        # observed live as max_curv=69.5 with delta=0.00 -- the MPC had no
+        # steering solution at all -- then 0.906 m of tracking error and a
+        # safety stop, mid-pass, with the route curvature at that point only
+        # 0.25.  The fold was entirely in the offset lane.
+        #
+        # This costs reach: 45.8% of the lap passable at 1.85 m against 23.3%
+        # here.  The berth barely moves (0.59 -> 0.54 m mean); what changes is
+        # that a pass is offered in fewer places rather than offered and then
+        # abandoned halfway.  Widening it again means re-recording the route,
+        # not raising this number.
+        self.declare_parameter("overtake_alongside_distance_m", 3.55)
         # Lane centering. See the assignment site for why 0.04 m could never
         # work and why the curvature gate is now a backstop, not the gate.
         self.declare_parameter("max_lane_offset_m", 0.12)
@@ -223,6 +301,10 @@ class QCar2PathMPC(Node):
         self.declare_parameter("lane_centering_curve_limit", 1.20)
         self.declare_parameter("solver_timeout_sec", 0.20)
         self.declare_parameter("lane_change_distance_m", 0.90)
+        # Merge-back S-curve length. Deliberately longer than the outbound:
+        # the swerve out must be decisive, the return must not overshoot.
+        # See _profiled_reference.
+        self.declare_parameter("return_change_distance_m", 1.60)
         self.declare_parameter("enable_v2v", False)
         self.declare_parameter("max_start_position_error", 0.35)
         self.declare_parameter("max_start_yaw_error_deg", 35.0)
@@ -355,19 +437,63 @@ class QCar2PathMPC(Node):
         self.overtake_mean_curve_limit = float(
             self.get_parameter("overtake_mean_curvature").value
         )
+        self.overtake_preview_distance_m = float(
+            self.get_parameter("overtake_preview_distance_m").value
+        )
+        self.min_overtake_offset_m = float(
+            self.get_parameter("min_overtake_offset_m").value
+        )
+        self.overtake_offset_search_step_m = float(
+            self.get_parameter("overtake_offset_search_step_m").value
+        )
+        self.overtake_kappa_limit = float(
+            self.get_parameter("overtake_kappa_limit").value
+        )
+        self.overtake_curvature_percentile = float(
+            self.get_parameter("overtake_curvature_percentile").value
+        )
+        if not 50.0 <= self.overtake_curvature_percentile <= 100.0:
+            raise ValueError(
+                "overtake_curvature_percentile must be in [50, 100]"
+            )
+        self.allow_right_side_overtake = bool(
+            self.get_parameter("allow_right_side_overtake").value
+        )
+        self.overtake_alongside_distance_m = float(
+            self.get_parameter("overtake_alongside_distance_m").value
+        )
+        if not 0.5 <= self.overtake_alongside_distance_m <= 5.0:
+            raise ValueError(
+                "overtake_alongside_distance_m must be in [0.5, 5.0] m"
+            )
+        self.feasible_offset = 0.0
+        if not 0.5 <= self.overtake_preview_distance_m <= 10.0:
+            raise ValueError(
+                "overtake_preview_distance_m must be in [0.5, 10.0] m"
+            )
         self.solver_timeout_sec = float(
             self.get_parameter("solver_timeout_sec").value
         )
         self.lane_change_distance_m = float(
             self.get_parameter("lane_change_distance_m").value
         )
+        self.return_change_distance_m = float(
+            self.get_parameter("return_change_distance_m").value
+        )
+        if not 0.50 <= self.return_change_distance_m <= 3.0:
+            raise ValueError(
+                "return_change_distance_m must be in [0.50, 3.0] m"
+            )
+        # The 1.5 ceiling is set by steering authority, not taste: the offset
+        # lane amplifies curvature, and tan(0.50)/0.256 = 2.13 is the hard
+        # tracking limit, so 1.5 keeps ~30% steering margin.
         if not (
             0.05 <= self.overtake_mean_curve_limit
-            <= self.overtake_curve_limit <= 1.0
+            <= self.overtake_curve_limit <= 1.5
         ):
             raise ValueError(
                 "Require 0.05 <= overtake_mean_curvature <= "
-                "overtake_max_curvature <= 1.0"
+                "overtake_max_curvature <= 1.5"
             )
         if not 0.05 <= self.solver_timeout_sec <= 1.0:
             raise ValueError("solver_timeout_sec must be in [0.05, 1.0] s")
@@ -635,6 +761,12 @@ class QCar2PathMPC(Node):
 
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel_nav", 10)
         self.allow_overtake_pub = self.create_publisher(Bool, "/allow_overtake", 10)
+        # Signed (left-positive) widest drivable passing offset here, 0.0 when
+        # no pass is geometrically possible.  lidar_overtake reads the SIGN to
+        # choose a side and the MAGNITUDE as the offset to command.
+        self.overtake_offset_pub = self.create_publisher(
+            Float32, "/overtake_offset_allowed", 10
+        )
         # Signed mean curvature of the route ahead. lidar_overtake bends its
         # detection corridor along this so that a curve no longer has to
         # disable the front box wholesale. See overtake_safety.
@@ -1447,15 +1579,48 @@ class QCar2PathMPC(Node):
             self.publish_overtake_disabled()
             return False, 0.0, 0.0
 
-        allow_overtake, metrics = overtake_curvature_preview(
+        # Preview the whole committed maneuver, not just the MPC horizon --
+        # see the note at the overtake_preview_distance_m declaration.
+        preview_points = max(
+            self.N,
+            int(round(
+                self.overtake_preview_distance_m
+                / max(self.path_spacing, 1e-6)
+            )),
+        )
+
+        # How wide a pass is actually drivable here.  This is the gate; the
+        # fixed-offset preview below is kept only for diagnostics.
+        alongside_points = max(
+            1,
+            int(round(
+                self.overtake_alongside_distance_m
+                / max(self.path_spacing, 1e-6)
+            )),
+        )
+        self.feasible_offset = feasible_overtake_offset(
+            self.trajectory[:, 3],
+            self.closest_idx,
+            alongside_points,
+            self.loop_path,
+            self.min_overtake_offset_m,
+            self.max_reference_offset,
+            self.overtake_offset_search_step_m,
+            self.overtake_kappa_limit,
+            allow_right=self.allow_right_side_overtake,
+            percentile=self.overtake_curvature_percentile,
+        )
+
+        _legacy_allowed, metrics = overtake_curvature_preview(
             self.trajectory[:, 3],
             self.overtake_offset_curvature,
             self.closest_idx,
-            self.N,
+            preview_points,
             self.loop_path,
             self.overtake_curve_limit,
             self.overtake_mean_curve_limit,
         )
+        allow_overtake = abs(self.feasible_offset) >= self.min_overtake_offset_m
         self.current_max_curvature = metrics["nominal_max"]
         self.current_mean_curvature = metrics["nominal_mean"]
         self.current_offset_max_curvature = metrics["offset_max"]
@@ -1475,6 +1640,10 @@ class QCar2PathMPC(Node):
         msg = Bool()
         msg.data = bool(allow_overtake)
         self.allow_overtake_pub.publish(msg)
+
+        offset_msg = Float32()
+        offset_msg.data = float(self.feasible_offset)
+        self.overtake_offset_pub.publish(offset_msg)
 
         return allow_overtake, max_curvature, mean_curvature
 
@@ -1519,8 +1688,19 @@ class QCar2PathMPC(Node):
             progress += self.path_open_length_m
         return max(0.0, progress)
 
-    def _profiled_reference(self, ref, start_s, start_offset, end_offset):
-        """Build a distance-based S-curve between two lane offsets."""
+    def _profiled_reference(self, ref, start_s, start_offset, end_offset,
+                            length_m=None):
+        """Build a distance-based S-curve between two lane offsets.
+
+        ``length_m`` defaults to the outbound lane-change distance.  The
+        return uses its own, longer length: collapsing the full passing
+        offset over the outbound 0.90 m puts the reference at a ~46 deg
+        crossing angle, which the tracker follows with lag and then pays
+        back as an overshoot past the lane centre -- measured on the course
+        as the car crossing the right white line on merge-back.
+        """
+        if length_m is None:
+            length_m = self.lane_change_distance_m
         points = np.asarray(ref, dtype=float).reshape(-1, 3)
         stage_arc = np.zeros(len(points), dtype=float)
         if len(points) > 1:
@@ -1529,7 +1709,7 @@ class QCar2PathMPC(Node):
             )
         phase = np.clip(
             (self._progress_since(start_s) + stage_arc)
-            / self.lane_change_distance_m,
+            / float(length_m),
             0.0,
             1.0,
         )
@@ -1654,6 +1834,7 @@ class QCar2PathMPC(Node):
                     self.return_transition_start_s,
                     self.return_transition_offset,
                     self.return_transition_target,
+                    length_m=self.return_change_distance_m,
                 )
                 self.avoidance_offset_filtered = current_offset
 

@@ -57,12 +57,19 @@ class LidarOvertakeNode(Node):
         # 0.80 m the return unlocked while the scanner was still short of the
         # lead's rear face -- the car reached its widest point upstream of the
         # obstacle and then merged back through it.
-        self.declare_parameter("min_overtake_progress_m", 1.65)
-        self.declare_parameter("min_return_progress_m", 0.90)
+        self.declare_parameter("min_overtake_progress_m", 1.85)
+        # Must cover the MPC's return_change_distance_m (1.60 m) so the state
+        # machine holds RETURN_RIGHT -- and with it maneuver speed and the
+        # swept-corridor checks -- for the whole merge S-curve.
+        self.declare_parameter("min_return_progress_m", 1.70)
+        # Extra distance past a completed pass after which a persistent flank
+        # return is treated as scenery (this course has walls inside the
+        # flank band) and loses its merge veto.  See OvertakeStateMachine.
+        self.declare_parameter("flank_override_progress_m", 1.20)
         # One lane (0.43 m) plus margin.  At 0.40 m a centred ROSbot cleared
         # the QCar's flank by 0.40 - 0.096 - 0.118 = 0.19 m before tracking
         # lag, and rather less after it.
-        self.declare_parameter("overtake_offset_m", 0.50)
+        self.declare_parameter("overtake_offset_m", 0.62)
         # Flank corridor: the lane being vacated, sampled beside and behind.
         # x_min is negative because the chassis is 0.425 m long with the
         # scanner at its centre.
@@ -88,11 +95,28 @@ class LidarOvertakeNode(Node):
         self.declare_parameter("return_outer_margin_m", 0.12)
         self.declare_parameter("return_inner_margin_m", 0.20)
         # Obstacle/emergency lookahead. See the note at the assignment site.
-        self.declare_parameter("front_stop_straight_m", 1.90)
-        self.declare_parameter("emergency_stop_straight_m", 0.70)
-        self.declare_parameter("front_stop_curve_m", 0.90)
-        self.declare_parameter("emergency_stop_curve_m", 0.65)
-        self.declare_parameter("overtake_start_min_distance_m", 1.50)
+        self.declare_parameter("front_stop_straight_m", 1.45)
+        self.declare_parameter("emergency_stop_straight_m", 0.60)
+        # Lowered from 0.90/0.65.  At 0.6 m/s the car needs 0.12 m to stop
+        # plus ~0.06 m of reaction, so 0.75 m still carries 4x margin over
+        # the 0.40 m hard stop, and the curve corridor -- which bends up to
+        # 0.62 m sideways over its length -- stops meeting scenery early.
+        self.declare_parameter("front_stop_curve_m", 0.75)
+        self.declare_parameter("emergency_stop_curve_m", 0.55)
+        self.declare_parameter("overtake_start_min_distance_m", 1.20)
+        # Range at which LANE_PROBE stops creeping closer.  0.0 means "derive
+        # it", which is the only setting that cannot go wrong: the probe must
+        # halt while a pass is still committable, so its floor belongs just
+        # ABOVE overtake_start_min_distance_m, never below it.
+        #
+        # This was the deadlock.  The probe's own default was 0.50 m against a
+        # 1.20 m commit distance, so an obstacle declared at 1.45 m put the car
+        # into LANE_PROBE, the probe walked it in to 0.70 m, and the pass gate
+        # then refused forever because 0.70 < 1.20.  Observed live as
+        # "allow_raw=True | enough_dist=False" with progress frozen: the car
+        # wanted to pass, was parked, and could never again satisfy the range
+        # it had just driven through.
+        self.declare_parameter("probe_min_gap_m", 0.0)
         self.declare_parameter("hard_stop_front_distance_m", 0.40)
         # How far the adjacent lane must be clear before a pass is allowed.
         # Previously hardcoded at the analyzer's 0.75 m default.
@@ -108,12 +132,31 @@ class LidarOvertakeNode(Node):
         # whether an off-centre object is seen at all -- see the note at the
         # analyzer construction.
         self.declare_parameter("lane_width_m", 0.43)
-        self.declare_parameter("emergency_half_width_m", 0.12)
+        self.declare_parameter("emergency_half_width_m", 0.15)
         # Curvature-following corridor. This is what detects an obstacle in a
         # curve, where the wide straight-ahead rectangle is meaningless. Keep
         # it wider than the car body and narrower than the lane half-width
         # (0.215 m at the default lane_width_m) so the road edge stays out.
-        self.declare_parameter("front_narrow_half_width_m", 0.16)
+        # 0.16 was barely the body: a person standing slightly off the path
+        # centreline fell outside it and was only caught by the close-in
+        # layers, so the car drew up to their feet before stopping.
+        self.declare_parameter("front_narrow_half_width_m", 0.20)
+        # How far out the WIDE front box may still declare an obstacle on a
+        # straight. The corridor is the primary detector; this backstop
+        # exists for what the corridor's width misses (a wide or well
+        # off-centre object). It must sit below the nearest wall the wide box
+        # can hold on this course (measured 1.29 m) or the wall becomes an
+        # obstacle again, and above the emergency range or an off-centre
+        # person is met at 0.70 m.
+        # Lowered 1.10 -> 0.65 against a wall measured live at 0.70 m.  The
+        # log that forced it: front=0.70 fc=76 with narrow=-1.00 nc=0 --
+        # the wide box held a wall while the corridor the car would actually
+        # sweep was completely empty, and the car sat parked in front of
+        # scenery.  0.65 is still above emergency_stop_straight_m (0.60), so
+        # a genuinely wide or off-centre object is met with braking room;
+        # past 0.65 the corridor decides alone, which is what detects the
+        # ROSbot out to front_stop_straight_m.
+        self.declare_parameter("front_wide_backstop_m", 0.65)
         self.declare_parameter("min_front_narrow_points", 2)
         # /path_curvature older than this falls back to a straight corridor,
         # which is the pre-existing behaviour.
@@ -124,6 +167,9 @@ class LidarOvertakeNode(Node):
         self.last_drive_state = None
         self.last_behavior_snapshot = None
         self.allow_overtake = False
+        # Widest drivable passing offset from the MPC. Starts at the
+        # configured maximum so a missing publisher keeps the old behaviour.
+        self.allowed_offset_m = float(gp("overtake_offset_m"))
         # Signed curvature of the route ahead, from the MPC. 0.0 (straight)
         # until the first message; see current_path_curvature().
         self.path_curvature = 0.0
@@ -219,6 +265,16 @@ class LidarOvertakeNode(Node):
         # rather than along the straight-ahead axis.
         self.front_stop_curve_m = float(gp("front_stop_curve_m"))
         self.emergency_stop_curve_m = float(gp("emergency_stop_curve_m"))
+        self.front_wide_backstop_m = float(gp("front_wide_backstop_m"))
+        if not (
+            self.emergency_stop_straight_m
+            <= self.front_wide_backstop_m
+            <= self.front_stop_straight_m
+        ):
+            raise ValueError(
+                "front_wide_backstop_m must lie between "
+                "emergency_stop_straight_m and front_stop_straight_m"
+            )
 
         self.min_front_narrow_points = max(
             1,
@@ -234,6 +290,19 @@ class LidarOvertakeNode(Node):
             gp("overtake_start_min_distance_m")
         )
         self.hard_stop_front_distance = float(gp("hard_stop_front_distance_m"))
+
+        # LANE_PROBE must stop creeping while the pass is still committable.
+        self.probe_min_gap_m = float(gp("probe_min_gap_m"))
+        if self.probe_min_gap_m <= 0.0:
+            self.probe_min_gap_m = self.overtake_start_min_distance + 0.05
+        if self.probe_min_gap_m <= self.overtake_start_min_distance:
+            raise ValueError(
+                f"probe_min_gap_m ({self.probe_min_gap_m:.2f}) must exceed "
+                "overtake_start_min_distance_m "
+                f"({self.overtake_start_min_distance:.2f}), or LANE_PROBE "
+                "drives the car below the range a pass may commit from and "
+                "the maneuver deadlocks with the obstacle still ahead."
+            )
 
         # These four must stay ordered or the pass is geometrically doomed
         # before it begins:
@@ -394,6 +463,8 @@ class LidarOvertakeNode(Node):
             min_overtake_steps=70,
             min_overtake_progress=self.min_overtake_progress_m,
             min_return_progress=float(gp("min_return_progress_m")),
+            flank_override_progress=float(gp("flank_override_progress_m")),
+            probe_min_gap_m=self.probe_min_gap_m,
         )
 
         self.offset_pub = self.create_publisher(Float32, "/avoidance_offset", 10)
@@ -434,6 +505,13 @@ class LidarOvertakeNode(Node):
             Bool,
             "/allow_overtake",
             self.allow_overtake_callback,
+            10,
+        )
+
+        self.allowed_offset_sub = self.create_subscription(
+            Float32,
+            "/overtake_offset_allowed",
+            self.allowed_offset_callback,
             10,
         )
 
@@ -678,6 +756,26 @@ class LidarOvertakeNode(Node):
     def allow_overtake_callback(self, msg):
         self.allow_overtake = bool(msg.data)
 
+    def allowed_offset_callback(self, msg):
+        """Widest passing offset the MPC says is drivable here.
+
+        Adopted only while a pass has not yet been committed.  Changing the
+        offset mid-pass would restart the MPC's S-curve from a new target and
+        swing the car sideways alongside the obstacle, so once OVERTAKE_LEFT
+        is entered the committed width is frozen until the car is back in
+        its own lane.
+        """
+        value = float(msg.data)
+        if not math.isfinite(value) or value < 0.0:
+            return
+        self.allowed_offset_m = min(value, self.overtake_offset_m)
+        if self.state_machine.state in (
+            self.state_machine.DRIVE,
+            self.state_machine.PROBE,
+            self.state_machine.WAIT,
+        ):
+            self.state_machine.overtake_offset = self.allowed_offset_m
+
     def path_curvature_callback(self, msg):
         value = float(msg.data)
         if not math.isfinite(value):
@@ -753,6 +851,7 @@ class LidarOvertakeNode(Node):
             front_stop_curve_m=self.front_stop_curve_m,
             emergency_stop_curve_m=self.emergency_stop_curve_m,
             min_front_narrow_points=self.min_front_narrow_points,
+            front_backstop_m=self.front_wide_backstop_m,
         )
 
     def force_no_overtake_zone(self, status):

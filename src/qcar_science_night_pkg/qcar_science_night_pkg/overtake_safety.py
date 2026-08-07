@@ -127,6 +127,7 @@ def limit_status_for_path_context(
     front_stop_curve_m,
     emergency_stop_curve_m,
     min_front_narrow_points=2,
+    front_backstop_m=None,
 ):
     """Apply curve/straight lookahead limits to a raw LiDAR status.
 
@@ -174,23 +175,50 @@ def limit_status_for_path_context(
     front_min = status.front_min
     front_count = status.front_count
 
+    # The corridor the analyzer swept along the route's own curvature is the
+    # volume the car will actually occupy, so it is the primary detector in
+    # both contexts.  It is not required to also appear in the wide box,
+    # because on a tight bend the corridor leaves that rectangle entirely.
+    narrow_hit = (
+        status.front_narrow_count >= int(min_front_narrow_points)
+        and 0.0 < status.front_narrow_min <= effective_front
+    )
+
     if context == "STRAIGHT":
-        front_too_far = status.front_min > effective_front
-        obstacle_ahead = status.obstacle_ahead and not front_too_far
-    else:
-        # The wide box can neither confirm nor deny an obstacle here, so it
-        # is not consulted at all; the curvature-following corridor decides.
-        # It is not required to also appear in the wide box, because on a
-        # tight bend the corridor leaves that rectangle entirely.
-        obstacle_ahead = (
-            status.front_narrow_count >= int(min_front_narrow_points)
-            and 0.0 < status.front_narrow_min <= effective_front
+        # The wide box used to be the sole authority here, and it is far too
+        # wide to be one.  "Straight" is only the MPC's lane-change
+        # permission; it does not mean the road has no edges.  Measured on
+        # the course: a wall held at front_min=1.30 m while the corridor the
+        # car would sweep was clear to 1.64 m, so the car declared an
+        # obstacle and stopped for scenery with nothing in its path.
+        #
+        # The box is therefore demoted to a mid-range backstop for something
+        # the corridor's width misses -- a wide or badly off-centre object.
+        # ``front_backstop_m`` sets its reach: below the nearest wall the box
+        # can hold on this course, above the emergency range so an off-centre
+        # person is met with braking room rather than at their feet. Callers
+        # that do not supply it keep the emergency range. Beyond the
+        # backstop the corridor decides alone.
+        backstop = (
+            float(front_backstop_m)
+            if front_backstop_m is not None
+            else effective_emergency
         )
-        if obstacle_ahead:
-            # The hard-stop check and the logs downstream read front_min, so
-            # report the measurement the decision was actually made on.
-            front_min = status.front_narrow_min
-            front_count = status.front_narrow_count
+        wide_hit = (
+            status.obstacle_ahead
+            and 0.0 < status.front_min <= backstop
+        )
+        obstacle_ahead = narrow_hit or wide_hit
+        use_narrow = narrow_hit and not wide_hit
+    else:
+        obstacle_ahead = narrow_hit
+        use_narrow = narrow_hit
+
+    if use_narrow:
+        # The hard-stop check and the logs downstream read front_min, so
+        # report the measurement the decision was actually made on.
+        front_min = status.front_narrow_min
+        front_count = status.front_narrow_count
 
     limited = type(status)(
         obstacle_ahead=obstacle_ahead,
